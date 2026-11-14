@@ -47,6 +47,7 @@ function initWebSocket() {
       } else if (msg.type === "download_progress") {
         handleDownloadProgress(msg.data);
       } else if (msg.type === "workspace_changed") {
+        if (msg.data?.workspace_dir) updateWorkspaceBadge(msg.data.workspace_dir);
         loadWorkspaceTree();
         loadDiffHistory();
       }
@@ -139,17 +140,7 @@ function updateTelemetryUI(data) {
     `~${ctxTokens.toLocaleString()} / ${maxK}k tok`;
 
   if (data.workspace_dir) {
-    const wsBar = document.getElementById("active-workspace-path-bar");
-    if (wsBar) {
-      wsBar.textContent = `📁 ${data.workspace_dir}`;
-      wsBar.title = `Active Godot 4 Project Folder: ${data.workspace_dir}`;
-    }
-    const headerFolder = document.getElementById("header-folder-name");
-    if (headerFolder) {
-      const parts = String(data.workspace_dir).replace(/\\/g, "/").split("/").filter(Boolean);
-      headerFolder.textContent = parts[parts.length - 1] || data.workspace_dir;
-      headerFolder.title = data.workspace_dir;
-    }
+    updateWorkspaceBadge(data.workspace_dir);
   }
 
   // Update State Machine Grid on Tab 3
@@ -189,6 +180,21 @@ function updateTelemetryUI(data) {
   }
 }
 
+function updateWorkspaceBadge(folderPath) {
+  if (!folderPath) return;
+  const wsBar = document.getElementById("active-workspace-path-bar");
+  if (wsBar) {
+    wsBar.textContent = `📁 ${folderPath}`;
+    wsBar.title = `Active Godot 4 Project Folder: ${folderPath}`;
+  }
+  const headerFolder = document.getElementById("header-folder-name");
+  if (headerFolder) {
+    const parts = String(folderPath).replace(/\\/g, "/").split("/").filter(Boolean);
+    headerFolder.textContent = parts[parts.length - 1] || folderPath;
+    headerFolder.title = folderPath;
+  }
+}
+
 // ============================================================================
 // Workspace Tree & Godot 4 3D Scene Graph Inspector
 // ============================================================================
@@ -199,8 +205,21 @@ async function loadWorkspaceTree() {
     const container = document.getElementById("file-tree");
     if (!data.entries) return;
 
-    container.innerHTML = data.entries
-      .filter((e) => e.type === "file")
+    const files = data.entries.filter((e) => e.type === "file");
+    if (files.length > 0 && !files.some((f) => f.res_path === state.currentFileResPath)) {
+      const preferred =
+        files.find((f) => f.res_path === "res://scenes/main.tscn") ||
+        files.find((f) => f.res_path === "res://scenes/main_3d.tscn") ||
+        files.find((f) => f.res_path.endsWith(".tscn")) ||
+        files.find((f) => f.res_path === "res://project.godot") ||
+        files[0];
+      if (preferred) {
+        state.currentFileResPath = preferred.res_path;
+        inspectWorkspaceFile(preferred.res_path);
+      }
+    }
+
+    container.innerHTML = files
       .map((item) => {
         const icon = getFileIcon(item.name);
         const isActive = item.res_path === state.currentFileResPath ? "active" : "";
@@ -598,13 +617,13 @@ function bindUIEvents() {
 }
 
 // ============================================================================
-// Project Folder Picker & Directory Browser Modal
+// Project Folder Picker, Creator & Directory Browser Modal
 // ============================================================================
 window.openFolderModal = async function (browsePath = null) {
   const modal = document.getElementById("folder-modal");
   const body = document.getElementById("folder-modal-body");
   modal.classList.remove("hidden");
-  body.innerHTML = "Loading directories...";
+  body.innerHTML = `<div style="padding:16px; color:#94a3b8;">Loading directories...</div>`;
 
   try {
     const [infoRes, browseRes] = await Promise.all([
@@ -615,66 +634,225 @@ window.openFolderModal = async function (browsePath = null) {
         body: JSON.stringify({ folder_path: browsePath }),
       }),
     ]);
+
+    if (!infoRes.ok || !browseRes.ok) {
+      body.innerHTML = `
+        <div style="padding:14px; background:rgba(248,113,113,0.12); border:1px solid rgba(248,113,113,0.4); border-radius:8px; color:#fecaca; font-size:12.5px; line-height:1.55;">
+          <strong>⚠️ Server Restart Required (HTTP ${browseRes.status})</strong><br/>
+          Your open command prompt window is still running an older <code>server.py</code> process from before the Folder Picker endpoints were added.<br/><br/>
+          <strong>Fix:</strong> Double-click <code>start_harness.bat</code> in <code>D:\\CodingProjects\\CustomHarness</code> (it will automatically stop the old server process on port 8000 and launch the updated server), then refresh this page.
+        </div>
+      `;
+      return;
+    }
+
     const info = await infoRes.json();
     const browse = await browseRes.json();
+    if (info.workspace_dir) updateWorkspaceBadge(info.workspace_dir);
 
-    const driveButtons = (browse.drives || [])
+    const currentBrowsed = browse.current_dir || info.workspace_dir || "";
+    const parentBrowsed = browse.parent_dir || currentBrowsed;
+
+    const quickBtnsHtml = (browse.quick_paths || [])
       .map(
-        (d) =>
-          `<button class="mini-btn" onclick="openFolderModal('${escapeHtml(d.replace(/\\/g, "\\\\"))}')">💾 ${escapeHtml(d)}</button>`
+        (qp) =>
+          `<button class="mini-btn js-browse-btn" data-path="${escapeHtml(qp.path)}">${escapeHtml(qp.label)}</button>`
       )
       .join(" ");
 
-    const subdirRows = (browse.subdirs || [])
+    const driveBtnsHtml = (browse.drives || [])
+      .map(
+        (d) =>
+          `<button class="mini-btn js-browse-btn" data-path="${escapeHtml(d)}">💾 ${escapeHtml(d)}</button>`
+      )
+      .join(" ");
+
+    const subdirRowsHtml = (browse.subdirs || [])
       .map((sd) => {
-        const escapedPath = escapeHtml(sd.path.replace(/\\/g, "\\\\"));
+        const isCurrentActive =
+          info.workspace_dir &&
+          sd.path.toLowerCase() === String(info.workspace_dir).toLowerCase();
         return `
-        <div class="setup-row" style="padding:6px 8px;">
-          <div style="cursor:pointer; flex:1;" onclick="openFolderModal('${escapedPath}')">
+        <div class="setup-row" style="padding:8px 10px; ${isCurrentActive ? "border-color:#38bdf8; background:rgba(56,189,248,0.08);" : ""}">
+          <div class="js-browse-btn" data-path="${escapeHtml(sd.path)}" style="cursor:pointer; flex:1;" title="Click to open inside this folder">
             <strong>📁 ${escapeHtml(sd.name)}</strong>
             ${sd.has_project_godot ? `<span style="color:#34d399; font-size:10.5px; margin-left:6px;">[Godot 4 Project]</span>` : ""}
-            <div style="color:#94a3b8; font-size:10px;">${escapeHtml(sd.path)}</div>
+            ${isCurrentActive ? `<span style="color:#38bdf8; font-size:10.5px; margin-left:6px;">[Active]</span>` : ""}
+            <div style="color:#94a3b8; font-size:10.5px; font-family:var(--font-mono);">${escapeHtml(sd.path)}</div>
           </div>
-          <button class="mini-btn" onclick="selectProjectFolder('${escapedPath}')">✓ Use This Folder</button>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <button class="mini-btn js-browse-btn" data-path="${escapeHtml(sd.path)}">Open &rarr;</button>
+            <button class="primary-btn js-select-btn" data-path="${escapeHtml(sd.path)}" style="padding:5px 10px; font-size:11.5px;">✓ Select Folder</button>
+          </div>
         </div>`;
       })
       .join("");
 
-    const escapedParent = escapeHtml((browse.parent_dir || "").replace(/\\/g, "\\\\"));
-    const escapedCurrent = escapeHtml((browse.current_dir || "").replace(/\\/g, "\\\\"));
-
     body.innerHTML = `
-      <div style="padding:10px; background:#0f172a; border:1px solid #1e293b; border-radius:6px; margin-bottom:12px;">
-        <div style="font-size:11px; color:#94a3b8; margin-bottom:4px;">
-          Current Active Godot 4 Project Folder: <strong style="color:#38bdf8;">${escapeHtml(info.workspace_dir)}</strong>
-        </div>
-        <div style="display:flex; gap:8px; align-items:center; margin-top:8px;">
-          <input id="folder-manual-input" type="text" value="${escapeHtml(browse.current_dir || info.workspace_dir)}" placeholder="Enter or paste any folder path (e.g. D:\\GodotProjects\\MyGame)..." style="flex:1; padding:6px 10px; background:#1e293b; color:#e2e8f0; border:1px solid #334155; border-radius:4px; font-family:var(--font-mono); font-size:11.5px;" />
-          <button class="primary-btn" style="padding:6px 12px; white-space:nowrap;" onclick="selectProjectFolder(document.getElementById('folder-manual-input').value)">
-            ✓ Set Active Folder
-          </button>
-          <button class="mini-btn" style="padding:6px 10px; white-space:nowrap;" onclick="pickNativeWindowsFolder()">
-            🪟 Windows Folder Dialog...
-          </button>
-        </div>
-      </div>
+      <div id="folder-modal-alert" class="hidden" style="margin-bottom:10px; padding:8px 12px; border-radius:6px; font-size:12px;"></div>
 
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; gap:8px;">
-        <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
-          <button class="mini-btn" onclick="openFolderModal('${escapedParent}')">⬆ Up One Level</button>
-          ${driveButtons}
+      <!-- 1. Active Folder & Native Windows Picker -->
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; padding:10px 12px; background:#0f172a; border:1px solid #1e293b; border-radius:8px; margin-bottom:10px; flex-wrap:wrap;">
+        <div style="min-width:220px; flex:1;">
+          <div style="font-size:11px; color:#94a3b8;">Active Godot 4 Project Folder:</div>
+          <div style="color:#38bdf8; font-family:var(--font-mono); font-size:12px; font-weight:600; word-break:break-all;">
+            ${escapeHtml(info.workspace_dir)}
+          </div>
         </div>
-        <button class="mini-btn" style="color:#34d399; border-color:#059669;" onclick="selectProjectFolder('${escapedCurrent}')">
-          ✓ Select Current Browsed Folder (${escapeHtml(browse.current_dir)})
+        <button id="btn-native-win-picker" class="primary-btn" style="padding:8px 14px; white-space:nowrap;">
+          🪟 Browse / Create in Windows Explorer...
         </button>
       </div>
 
-      <div style="max-height:320px; overflow-y:auto; border:1px solid #1e293b; border-radius:6px; padding:4px;">
-        ${subdirRows || `<div style="padding:12px; color:#94a3b8; font-size:11.5px;">No subdirectories inside ${escapeHtml(browse.current_dir)}. Click "Set Active Folder" above to use this folder.</div>`}
+      <!-- 2. Create New Project Folder Inside Current Location -->
+      <div style="padding:10px 12px; background:#0f172a; border:1px solid #1e293b; border-radius:8px; margin-bottom:10px;">
+        <div style="font-size:11.5px; color:#e2e8f0; font-weight:600; margin-bottom:6px;">
+          ➕ Create New Project Folder in <code style="color:#93c5fd;">${escapeHtml(currentBrowsed)}</code>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <input id="new-folder-name-input" type="text" placeholder="New folder name (e.g. NebulaBreaker)..." style="flex:1; padding:6px 10px; background:#1e293b; color:#e2e8f0; border:1px solid #334155; border-radius:6px; font-size:12px;" />
+          <button id="btn-create-and-select-folder" class="primary-btn" style="padding:6px 12px; white-space:nowrap;">
+            ➕ Create &amp; Use Folder
+          </button>
+          <button id="btn-create-only-folder" class="mini-btn" style="padding:6px 10px; white-space:nowrap;">
+            + Create Only
+          </button>
+        </div>
+      </div>
+
+      <!-- 3. Navigation Bar: Up, Quick Jumps, Drives & Select Current Folder -->
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:8px; flex-wrap:wrap;">
+        <div style="display:flex; gap:5px; align-items:center; flex-wrap:wrap;">
+          <button class="mini-btn js-browse-btn" data-path="${escapeHtml(parentBrowsed)}">⬆ Up One Level</button>
+          ${quickBtnsHtml}
+          ${driveBtnsHtml}
+        </div>
+        <button class="primary-btn js-select-btn" data-path="${escapeHtml(currentBrowsed)}" style="padding:5px 12px; font-size:11.5px; background:#059669;">
+          ✓ Use Current Folder (${escapeHtml(currentBrowsed.split(/[\\/]/).filter(Boolean).pop() || currentBrowsed)})
+        </button>
+      </div>
+
+      <!-- 4. Current Browsed Path Bar -->
+      <div style="display:flex; gap:6px; align-items:center; margin-bottom:8px;">
+        <span style="font-size:11px; color:#94a3b8; white-space:nowrap;">Browsing:</span>
+        <input id="folder-manual-input" type="text" value="${escapeHtml(currentBrowsed)}" style="flex:1; padding:5px 8px; background:#1e293b; color:#cbd5e1; border:1px solid #334155; border-radius:5px; font-family:var(--font-mono); font-size:11.5px;" />
+        <button id="btn-go-manual-path" class="mini-btn" style="padding:5px 10px;">Go</button>
+        <button id="btn-select-manual-path" class="mini-btn" style="padding:5px 10px; color:#34d399; border-color:#059669;">✓ Set Active</button>
+      </div>
+
+      <!-- 5. Subdirectory List -->
+      <div style="max-height:280px; overflow-y:auto; border:1px solid #1e293b; border-radius:8px; padding:6px; background:#090d16;">
+        ${
+          subdirRowsHtml ||
+          `<div style="padding:16px; color:#94a3b8; font-size:12px; text-align:center;">
+            No subfolders inside <code>${escapeHtml(currentBrowsed)}</code>.<br/>
+            Click <strong>"✓ Use Current Folder"</strong> above or create a new folder using <strong>"➕ Create &amp; Use Folder"</strong>.
+          </div>`
+        }
       </div>
     `;
+
+    // Bind all Browse buttons cleanly without inline string-escaping issues
+    body.querySelectorAll(".js-browse-btn").forEach((el) => {
+      el.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const p = el.getAttribute("data-path");
+        if (p) openFolderModal(p);
+      });
+    });
+
+    // Bind all Select buttons cleanly
+    body.querySelectorAll(".js-select-btn").forEach((el) => {
+      el.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const p = el.getAttribute("data-path");
+        if (p) selectProjectFolder(p);
+      });
+    });
+
+    // Bind Native Windows Explorer Folder Picker button
+    const nativeBtn = document.getElementById("btn-native-win-picker");
+    if (nativeBtn) {
+      nativeBtn.addEventListener("click", () => pickNativeWindowsFolder(nativeBtn));
+    }
+
+    // Bind Create New Folder buttons
+    const newFolderInput = document.getElementById("new-folder-name-input");
+    const btnCreateSelect = document.getElementById("btn-create-and-select-folder");
+    const btnCreateOnly = document.getElementById("btn-create-only-folder");
+
+    if (btnCreateSelect && newFolderInput) {
+      btnCreateSelect.addEventListener("click", () => {
+        createNewProjectFolder(currentBrowsed, newFolderInput.value, true);
+      });
+      newFolderInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          createNewProjectFolder(currentBrowsed, newFolderInput.value, true);
+        }
+      });
+    }
+    if (btnCreateOnly && newFolderInput) {
+      btnCreateOnly.addEventListener("click", () => {
+        createNewProjectFolder(currentBrowsed, newFolderInput.value, false);
+      });
+    }
+
+    // Bind manual path Go / Set Active
+    const manualInput = document.getElementById("folder-manual-input");
+    document.getElementById("btn-go-manual-path")?.addEventListener("click", () => {
+      if (manualInput?.value) openFolderModal(manualInput.value.trim());
+    });
+    document.getElementById("btn-select-manual-path")?.addEventListener("click", () => {
+      if (manualInput?.value) selectProjectFolder(manualInput.value.trim());
+    });
   } catch (err) {
-    body.innerHTML = `<div style="color:#f87171;">Failed to browse folders: ${escapeHtml(String(err))}</div>`;
+    body.innerHTML = `<div style="color:#f87171; padding:12px;">Failed to browse folders: ${escapeHtml(String(err))}</div>`;
+  }
+};
+
+function showFolderModalAlert(msg, isError = true) {
+  const el = document.getElementById("folder-modal-alert");
+  if (!el) return;
+  el.classList.remove("hidden");
+  el.style.background = isError ? "rgba(248,113,113,0.14)" : "rgba(52,211,153,0.14)";
+  el.style.border = isError ? "1px solid rgba(248,113,113,0.4)" : "1px solid rgba(52,211,153,0.4)";
+  el.style.color = isError ? "#fecaca" : "#a7f3d0";
+  el.textContent = msg;
+}
+
+window.createNewProjectFolder = async function (parentPath, newFolderName, selectImmediately = true) {
+  const trimmed = (newFolderName || "").trim();
+  if (!trimmed) {
+    showFolderModalAlert("Please enter a name for the new folder first.", true);
+    document.getElementById("new-folder-name-input")?.focus();
+    return;
+  }
+  try {
+    const res = await fetch("/api/workspace/mkdir", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        parent_path: parentPath,
+        new_folder_name: trimmed,
+        select_immediately: selectImmediately,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showFolderModalAlert(data.detail || `Failed to create folder (HTTP ${res.status})`, true);
+      return;
+    }
+    if (selectImmediately && data.workspace_dir) {
+      updateWorkspaceBadge(data.workspace_dir);
+      if (data.telemetry) updateTelemetryUI(data.telemetry);
+      document.getElementById("folder-modal").classList.add("hidden");
+      await Promise.all([loadWorkspaceTree(), loadDiffHistory()]);
+    } else {
+      await openFolderModal(data.created_dir || parentPath);
+    }
+  } catch (err) {
+    showFolderModalAlert(`Error creating folder: ${err}`, true);
   }
 };
 
@@ -687,25 +865,45 @@ window.selectProjectFolder = async function (folderPath) {
       body: JSON.stringify({ folder_path: folderPath.trim(), init_starter_if_empty: false }),
     });
     const data = await res.json();
+    if (!res.ok) {
+      showFolderModalAlert(data.detail || `Failed to switch folder (HTTP ${res.status})`, true);
+      return;
+    }
+    if (data.workspace_dir) updateWorkspaceBadge(data.workspace_dir);
     if (data.telemetry) updateTelemetryUI(data.telemetry);
     document.getElementById("folder-modal").classList.add("hidden");
     await Promise.all([loadWorkspaceTree(), loadDiffHistory()]);
   } catch (err) {
-    console.error("Failed to switch folder:", err);
+    showFolderModalAlert(`Failed to switch folder: ${err}`, true);
   }
 };
 
-window.pickNativeWindowsFolder = async function () {
+window.pickNativeWindowsFolder = async function (btnEl = null) {
+  const origText = btnEl ? btnEl.textContent : "";
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = "⏳ Waiting for Windows Folder Dialog...";
+  }
   try {
     const res = await fetch("/api/workspace/pick_native", { method: "POST" });
     const data = await res.json();
-    if (data.status === "success") {
+    if (!res.ok) {
+      showFolderModalAlert(data.detail || `Windows Folder Dialog error (HTTP ${res.status})`, true);
+      return;
+    }
+    if (data.status === "success" && data.workspace_dir) {
+      updateWorkspaceBadge(data.workspace_dir);
       if (data.telemetry) updateTelemetryUI(data.telemetry);
       document.getElementById("folder-modal").classList.add("hidden");
       await Promise.all([loadWorkspaceTree(), loadDiffHistory()]);
     }
   } catch (err) {
-    console.error("Native folder dialog failed:", err);
+    showFolderModalAlert(`Native folder dialog failed: ${err}`, true);
+  } finally {
+    if (btnEl) {
+      btnEl.disabled = false;
+      btnEl.textContent = origText;
+    }
   }
 };
 

@@ -52,8 +52,39 @@ logging.basicConfig(
 logger = logging.getLogger("CustomHarness.Server")
 
 BASE_DIR = Path(__file__).parent.resolve()
-WORKSPACE_DIR = BASE_DIR / "workspace"
+DEFAULT_WORKSPACE_DIR = BASE_DIR / "workspace"
+WORKSPACE_CONFIG_FILE = BASE_DIR / "cache" / "workspace_config.json"
 STATIC_DIR = BASE_DIR / "static"
+
+
+def _load_persisted_workspace_dir() -> Path:
+    """Load the user's last selected project folder from ./cache/workspace_config.json if available."""
+    try:
+        if WORKSPACE_CONFIG_FILE.exists():
+            data = json.loads(WORKSPACE_CONFIG_FILE.read_text(encoding="utf-8"))
+            saved = data.get("workspace_dir")
+            if saved:
+                p = Path(saved).resolve()
+                p.mkdir(parents=True, exist_ok=True)
+                return p
+    except Exception as exc:
+        logger.warning(f"Could not read persisted workspace config: {exc}")
+    return DEFAULT_WORKSPACE_DIR
+
+
+def _save_persisted_workspace_dir(target_dir: Path) -> None:
+    """Persist the user's selected project folder to ./cache/workspace_config.json."""
+    try:
+        WORKSPACE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        WORKSPACE_CONFIG_FILE.write_text(
+            json.dumps({"workspace_dir": str(target_dir.resolve())}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.warning(f"Could not save workspace config: {exc}")
+
+
+WORKSPACE_DIR = _load_persisted_workspace_dir()
 
 
 # =============================================================================
@@ -165,7 +196,11 @@ def ensure_starter_godot_workspace(workspace: Path) -> None:
         )
 
 
-ensure_starter_godot_workspace(WORKSPACE_DIR)
+ensure_starter_godot_workspace(DEFAULT_WORKSPACE_DIR)
+if not (WORKSPACE_DIR / "project.godot").exists():
+    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+    for _sub in ("scenes", "scripts", "assets/textures", "assets/models", "assets/audio", "assets/ui"):
+        (WORKSPACE_DIR / _sub).mkdir(parents=True, exist_ok=True)
 
 
 # =============================================================================
@@ -202,6 +237,7 @@ main_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 def _on_orchestrator_state_change(snapshot: Dict[str, Any]) -> None:
+    snapshot["workspace_dir"] = str(WORKSPACE_DIR)
     if main_event_loop and main_event_loop.is_running():
         asyncio.run_coroutine_threadsafe(
             ws_manager.broadcast("telemetry_update", snapshot),
@@ -211,6 +247,7 @@ def _on_orchestrator_state_change(snapshot: Dict[str, Any]) -> None:
 
 orchestrator = VRAMOrchestrator(
     base_dir=BASE_DIR,
+    project_root=WORKSPACE_DIR,
     on_state_change=_on_orchestrator_state_change,
 )
 image_worker = ImageGenWorker(orchestrator=orchestrator, workspace_dir=WORKSPACE_DIR)
@@ -341,6 +378,12 @@ class WorkspaceSelectRequest(BaseModel):
 
 class WorkspaceBrowseRequest(BaseModel):
     folder_path: Optional[str] = None
+
+
+class WorkspaceMkdirRequest(BaseModel):
+    parent_path: str
+    new_folder_name: str
+    select_immediately: bool = True
 
 
 # =============================================================================
@@ -2080,37 +2123,69 @@ async def api_workspace_info() -> Dict[str, Any]:
 
 @app.post("/api/workspace/browse")
 async def api_workspace_browse(req: WorkspaceBrowseRequest) -> Dict[str, Any]:
-    """List subdirectories and available Windows drives for the in-app Folder Picker modal."""
-    target = Path(req.folder_path).resolve() if req.folder_path else tool_executor.workspace_dir.parent
-    if not target.exists() or not target.is_dir():
+    """List subdirectories, quick-jump locations, and Windows drives for the in-app Folder Picker modal."""
+    try:
+        target = Path(req.folder_path).resolve() if req.folder_path else tool_executor.workspace_dir.parent
+        if not target.exists() or not target.is_dir():
+            target = tool_executor.workspace_dir
+    except Exception:
         target = tool_executor.workspace_dir
 
     drives: List[str] = []
     if os.name == "nt":
         for d_letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
-            drive_root = Path(f"{d_letter}:\\")
-            if drive_root.exists():
-                drives.append(str(drive_root))
+            try:
+                drive_root = Path(f"{d_letter}:\\")
+                if drive_root.exists():
+                    drives.append(str(drive_root))
+            except Exception:
+                continue
+
+    quick_paths: List[Dict[str, str]] = []
+    candidates = [
+        ("💻 Projects Root", BASE_DIR.parent),
+        ("📦 Default (./workspace)", DEFAULT_WORKSPACE_DIR),
+        ("🏠 Desktop", Path.home() / "Desktop"),
+        ("📂 Documents", Path.home() / "Documents"),
+    ]
+    for label, qp in candidates:
+        try:
+            if qp.exists() and qp.is_dir():
+                quick_paths.append({"label": label, "path": str(qp.resolve())})
+        except Exception:
+            pass
 
     subdirs: List[Dict[str, Any]] = []
     try:
         for entry in sorted(target.iterdir(), key=lambda p: p.name.lower()):
-            if entry.is_dir() and not entry.name.startswith("."):
-                has_godot = (entry / "project.godot").exists()
-                subdirs.append(
-                    {
-                        "name": entry.name,
-                        "path": str(entry.resolve()),
-                        "has_project_godot": has_godot,
-                    }
-                )
+            try:
+                if entry.is_dir() and not entry.name.startswith("."):
+                    try:
+                        has_godot = (entry / "project.godot").exists()
+                    except Exception:
+                        has_godot = False
+                    subdirs.append(
+                        {
+                            "name": entry.name,
+                            "path": str(entry.resolve()),
+                            "has_project_godot": has_godot,
+                        }
+                    )
+            except Exception:
+                continue
     except Exception as exc:
         logger.debug(f"Browse folder warning for {target}: {exc}")
 
+    try:
+        parent_str = str(target.parent) if target.parent != target else str(target)
+    except Exception:
+        parent_str = str(target)
+
     return {
         "current_dir": str(target),
-        "parent_dir": str(target.parent) if target.parent != target else str(target),
+        "parent_dir": parent_str,
         "drives": drives,
+        "quick_paths": quick_paths,
         "subdirs": subdirs[:200],
     }
 
@@ -2139,6 +2214,7 @@ async def _apply_workspace_folder_switch(
         )
 
     WORKSPACE_DIR = target_path
+    _save_persisted_workspace_dir(target_path)
     tool_executor.set_workspace_dir(target_path)
     await orchestrator.switch_session(
         conversation_id=orchestrator.conversation_id,
@@ -2160,6 +2236,30 @@ async def _apply_workspace_folder_switch(
     }
 
 
+@app.post("/api/workspace/mkdir")
+async def api_workspace_mkdir(req: WorkspaceMkdirRequest) -> Dict[str, Any]:
+    """Create a new folder inside `parent_path` and optionally switch to it immediately."""
+    parent = Path((req.parent_path or "").strip() or str(tool_executor.workspace_dir.parent)).resolve()
+    raw_name = (req.new_folder_name or "").strip()
+    if not raw_name:
+        raise HTTPException(status_code=400, detail="Folder name cannot be empty.")
+    safe_name = re.sub(r'[<>:"|?*]', "_", raw_name).strip(". /\\")
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="Invalid folder name.")
+
+    new_dir = (parent / safe_name).resolve()
+    new_dir.mkdir(parents=True, exist_ok=True)
+    if req.select_immediately:
+        res = await _apply_workspace_folder_switch(new_dir, init_starter_if_empty=False)
+        res["created_dir"] = str(new_dir)
+        return res
+    return {
+        "status": "created",
+        "created_dir": str(new_dir),
+        "workspace_dir": str(tool_executor.workspace_dir),
+    }
+
+
 @app.post("/api/workspace/select")
 async def api_workspace_select(req: WorkspaceSelectRequest) -> Dict[str, Any]:
     """Switch the active Godot 4 project folder to any local path."""
@@ -2173,18 +2273,58 @@ async def api_workspace_select(req: WorkspaceSelectRequest) -> Dict[str, Any]:
 
 @app.post("/api/workspace/pick_native")
 async def api_workspace_pick_native() -> Dict[str, Any]:
-    """Open the native Windows OS folder chooser dialog and switch to the chosen folder."""
-    def _open_tk_folder_dialog() -> Optional[str]:
+    """Open a foreground Windows OS folder chooser dialog (with New Folder button) and switch to it."""
+    import subprocess
+
+    def _open_native_folder_dialog() -> Optional[str]:
+        initial_dir = str(tool_executor.workspace_dir.parent)
+        if os.name == "nt":
+            try:
+                ps_script = (
+                    "Add-Type -AssemblyName System.Windows.Forms; "
+                    "$f = New-Object System.Windows.Forms.Form; "
+                    "$f.TopMost = $true; "
+                    "$f.StartPosition = 'CenterScreen'; "
+                    "$f.Width = 1; $f.Height = 1; "
+                    "$f.ShowInTaskbar = $false; "
+                    "$f.Opacity = 0; "
+                    "$f.Show(); "
+                    "$f.Activate(); "
+                    "$dlg = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                    "$dlg.Description = 'Select or Create Godot 4 Project Folder'; "
+                    "$dlg.ShowNewFolderButton = $true; "
+                    f"$dlg.SelectedPath = '{initial_dir.replace(chr(39), chr(39)*2)}'; "
+                    "if ($dlg.ShowDialog($f) -eq [System.Windows.Forms.DialogResult]::OK) { "
+                    "  [Console]::Out.Write($dlg.SelectedPath) "
+                    "} "
+                    "$f.Close();"
+                )
+                proc = subprocess.run(
+                    ["powershell", "-NoProfile", "-STA", "-Command", ps_script],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                out = (proc.stdout or "").strip()
+                if out:
+                    return out
+                if proc.returncode == 0:
+                    return None
+            except Exception as exc:
+                logger.warning(f"PowerShell STA FolderBrowserDialog fallback: {exc}")
+
         try:
             import tkinter as tk
             from tkinter import filedialog
 
             root = tk.Tk()
-            root.withdraw()
             root.attributes("-topmost", True)
+            root.withdraw()
+            root.focus_force()
             chosen = filedialog.askdirectory(
-                initialdir=str(tool_executor.workspace_dir.parent),
-                title="Select Godot 4 Project Folder — Local Agentic Harness",
+                parent=root,
+                initialdir=initial_dir,
+                title="Select or Create Godot 4 Project Folder",
             )
             root.destroy()
             return chosen or None
@@ -2192,7 +2332,7 @@ async def api_workspace_pick_native() -> Dict[str, Any]:
             logger.warning(f"Native folder dialog fallback: {exc}")
             return None
 
-    chosen_dir = await asyncio.to_thread(_open_tk_folder_dialog)
+    chosen_dir = await asyncio.to_thread(_open_native_folder_dialog)
     if not chosen_dir:
         return {"status": "cancelled", "workspace_dir": str(tool_executor.workspace_dir)}
     return await _apply_workspace_folder_switch(Path(chosen_dir), init_starter_if_empty=False)
@@ -2259,11 +2399,39 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 async def serve_index() -> HTMLResponse:
     index_file = STATIC_DIR / "index.html"
     if index_file.exists():
-        return HTMLResponse(index_file.read_text(encoding="utf-8"))
+        return HTMLResponse(
+            index_file.read_text(encoding="utf-8"),
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
     return HTMLResponse("<h1>Godot 4 Agentic Harness Backend Running</h1>")
+
+
+def _free_port_if_in_use(port: int = 8000) -> None:
+    """If an older instance of server.py is still holding port 8000, terminate it cleanly."""
+    try:
+        import psutil
+
+        my_pid = os.getpid()
+        for conn in psutil.net_connections(kind="inet"):
+            if conn.laddr and conn.laddr.port == port and conn.status == "LISTEN":
+                pid = conn.pid
+                if pid and pid != my_pid:
+                    try:
+                        proc = psutil.Process(pid)
+                        logger.info(f"Stopping previous server process on port {port} (PID {pid})...")
+                        proc.terminate()
+                        proc.wait(timeout=4.0)
+                    except Exception:
+                        try:
+                            psutil.Process(pid).kill()
+                        except Exception:
+                            pass
+    except Exception as exc:
+        logger.debug(f"Port check warning: {exc}")
 
 
 if __name__ == "__main__":
     import uvicorn
 
+    _free_port_if_in_use(8000)
     uvicorn.run(app, host="127.0.0.1", port=8000, reload=False)
