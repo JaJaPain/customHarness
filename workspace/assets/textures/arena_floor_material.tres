@@ -1,0 +1,16 @@
+[gd_resource type="StandardMaterial3D" load_steps=5 format=3]
+
+[ext_resource type="Texture2D" path="res://assets/textures/arena_floor.png" id="1_albedo"]
+[ext_resource type="Texture2D" path="res://assets/textures/arena_floor_normal.png" id="2_normal"]
+[ext_resource type="Texture2D" path="res://assets/textures/arena_floor_roughness.png" id="3_roughness"]
+[ext_resource type="Texture2D" path="res://assets/textures/arena_floor_height.png" id="4_height"]
+
+[resource]
+albedo_texture = ExtResource("1_albedo")
+roughness_texture = ExtResource("3_roughness")
+normal_enabled = true
+normal_scale = 1.5
+normal_texture = ExtResource("2_normal")
+heightmap_enabled = true
+heightmap_scale = 0.05
+heightmap_texture = ExtResource("4_height")

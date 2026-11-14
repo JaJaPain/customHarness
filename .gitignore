@@ -1,0 +1,42 @@
+# Local LLM / 2D / Audio Model Weights (Excluded from Git)
+models/*
+!models/.gitkeep
+*.gguf
+*.safetensors
+*.ckpt
+*.onnx
+*.pt
+*.pth
+*.part
+
+# Portable Windows CUDA Binaries (Excluded from Git)
+bin/*
+!bin/.gitkeep
+*.exe
+*.dll
+
+# Runtime KV Cache, Slots, Logs & Local SQLite RAG Store
+cache/
+*.db
+*.db-journal
+*.db-wal
+
+# Python Bytecode & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Harness Backups & Godot Editor Cache
+*.bak
+workspace/.harness_backups/
+workspace/.godot/
+.godot/
+
+# OS / IDE Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
