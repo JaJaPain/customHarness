@@ -10,7 +10,7 @@ Runs directly on portable Windows CUDA binaries (`llama-server.exe` + `sd.exe`),
 
 1. **Mutually Exclusive GPU Engines & 3-Tier Lazy KV Cache (`vram_orchestrator.py`)**
    - **Tier 1 (VRAM First — Default):** Keeps 100% of `Ornith-1.5-9B-Q6_K.gguf` + `mmproj-Ornith-1.5-9B-f16.gguf` (`-ngl 99`) and a 32,768-token `q8_0` KV cache inside the 12GB RTX 3060 VRAM.
-   - **Tier 2 (Lazy Host-RAM Spillover via `--cram 8192`):** Uses an 8GB host-memory prompt cache pool (`--cram 8192 --cache-reuse 256`) and automatic 96k context expansion (`HYBRID_RAM_OVERFLOW` with `--fit on`) into 32GB DDR4 RAM when context exceeds 26,000 tokens.
+   - **Tier 2 (Lazy Host-RAM Spillover via `--cache-ram 8192`):** Uses an 8GB host-memory prompt cache pool (`--cache-ram 8192 --cache-reuse 256`) and automatic 96k context expansion (`HYBRID_RAM_OVERFLOW` with `--fit on`) into 32GB DDR4 RAM when context exceeds 26,000 tokens.
    - **Tier 3 (NVMe Disk Persistence & 15GB LRU Eviction):** `DiskKVCacheManager` hashes `project_root + system_prompt + conversation_id` and persists/restores KV slots to `./cache/kv_disk/` (`POST /slots/0?action=save` / `restore`) across image/audio swaps, session switches, and harness shutdown.
    - **Batched Asset VRAM Swaps:** Automatically keeps `llama-server.exe` unloaded across consecutive `generate_2d_asset` or `generate_game_audio` calls in the same turn (`defer_llm_restore=True`) and restores the LLM KV slot once before the vision verification turn.
    - **Godot 3D Play-Mode VRAM Yield (`GODOT_YIELDED`):** Detects `Godot_v4*` preview windows exceeding 2.5GB VRAM and yields the GPU automatically.

@@ -40,3 +40,6 @@ workspace/.godot/
 Thumbs.db
 .vscode/
 .idea/
+
+# Saved chat conversations (per project)
+**/.harness/conversations/

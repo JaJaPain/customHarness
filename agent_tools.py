@@ -121,8 +121,10 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "function": {
             "name": "apply_diff",
             "description": (
-                "Apply a targeted edit to an existing file using search/replace or a unified diff patch. "
-                "Automatically creates a .bak rollback snapshot and validates GDScript if editing a .gd file."
+                "Edit an existing file by replacing one block of text with another. Copy `search_text` from "
+                "read_file output WITHOUT the leading line numbers ('  12 | '). Indentation differences are "
+                "tolerated, but the lines themselves must match and must be unique in the file. "
+                "A backup is saved and .gd files are syntax-checked automatically."
             ),
             "parameters": {
                 "type": "object",
@@ -133,20 +135,14 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     },
                     "search_text": {
                         "type": "string",
-                        "description": "Exact existing block of text to find in the file.",
+                        "description": "Existing lines to find (a few whole lines are best).",
                     },
                     "replace_text": {
                         "type": "string",
-                        "description": "Replacement text to substitute in place of search_text.",
-                    },
-                    "unified_diff": {
-                        "type": "string",
-                        "description": (
-                            "Alternative: unified diff patch or <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE block."
-                        ),
+                        "description": "New lines that replace search_text.",
                     },
                 },
-                "required": ["path"],
+                "required": ["path", "search_text", "replace_text"],
             },
         },
     },
@@ -177,10 +173,45 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "set_input_action",
+            "description": (
+                "Create or replace an input action in project.godot with correctly formatted key / mouse "
+                "bindings. ALWAYS use this instead of hand-editing the [input] section. An action with no "
+                "bindings never fires, so every action used by Input.is_action_pressed()/get_axis() needs this."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Action name used in scripts, e.g. 'move_left' or 'launch_ball'.",
+                    },
+                    "keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Keyboard keys: letters 'a'-'z', digits '0'-'9', 'space', 'enter', 'escape', 'tab', "
+                            "'shift', 'ctrl', 'alt', 'left', 'right', 'up', 'down', 'backspace', 'f1'-'f12'."
+                        ),
+                    },
+                    "mouse_buttons": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["left", "right", "middle"]},
+                        "description": "Optional mouse buttons that also trigger the action.",
+                    },
+                },
+                "required": ["action", "keys"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_command",
             "description": (
-                "Execute a shell command or run Godot 4 headless --check-only GDScript validation. "
-                "Respects the UI command approval toggle."
+                "Run a shell command in the project folder. The command `godot --headless --quit` is special: "
+                "it validates every scene and script AND runs the game headless for a moment, reporting "
+                "parse errors and runtime errors. Run it after every change."
             ),
             "parameters": {
                 "type": "object",
@@ -648,6 +679,12 @@ class AgentToolExecutor:
                     path=arguments["path"],
                     content=arguments["content"],
                 )
+            if tool_name == "set_input_action":
+                return self.tool_set_input_action(
+                    action=str(arguments["action"]),
+                    keys=arguments.get("keys") or [],
+                    mouse_buttons=arguments.get("mouse_buttons") or [],
+                )
             if tool_name == "run_command":
                 return await self.tool_run_command(
                     command=arguments["command"],
@@ -715,6 +752,12 @@ class AgentToolExecutor:
                 )
 
             return {"status": "error", "error": f"Unknown tool '{tool_name}'"}
+        except KeyError as exc:
+            return {
+                "status": "error",
+                "tool": tool_name,
+                "error": f"Missing required argument {exc} for tool '{tool_name}'. Call it again with valid JSON arguments.",
+            }
         except Exception as exc:
             logger.exception(f"Tool execution failed ({tool_name}): {exc}")
             return {"status": "error", "tool": tool_name, "error": str(exc)}
@@ -887,20 +930,36 @@ class AgentToolExecutor:
 
         # Case 1: Explicit search_text & replace_text
         if search_text is not None and replace_text is not None:
-            if search_text in updated_content:
+            search_text, replace_text = self._strip_line_number_prefixes(search_text, replace_text)
+            exact_hits = updated_content.count(search_text) if search_text else 0
+            if exact_hits > 1:
+                return {
+                    "status": "error",
+                    "error": (
+                        f"search_text matches {exact_hits} places in {self.to_res_path(target)}. "
+                        "Include more surrounding lines so it is unique. Nothing was changed."
+                    ),
+                }
+            if exact_hits == 1:
                 updated_content = updated_content.replace(search_text, replace_text, 1)
             else:
-                # Try normalized line endings (CRLF <-> LF)
                 norm_orig = updated_content.replace("\r\n", "\n")
                 norm_search = search_text.replace("\r\n", "\n")
                 norm_replace = replace_text.replace("\r\n", "\n")
-                if norm_search in norm_orig:
+                if norm_search and norm_search in norm_orig:
                     updated_content = norm_orig.replace(norm_search, norm_replace, 1)
                 else:
-                    return {
-                        "status": "error",
-                        "error": f"search_text block not found in {self.to_res_path(target)}. Read the file first to confirm exact lines.",
-                    }
+                    # Whitespace-tolerant fallback: small models often get tabs/indentation wrong
+                    fuzzy, problem = self._whitespace_tolerant_replace(norm_orig, norm_search, norm_replace)
+                    if fuzzy is None:
+                        return {
+                            "status": "error",
+                            "error": (
+                                f"search_text was not applied to {self.to_res_path(target)}: {problem} "
+                                "Nothing was changed."
+                            ),
+                        }
+                    updated_content = fuzzy
 
         # Case 2: <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE or Unified Diff
         elif unified_diff:
@@ -959,6 +1018,182 @@ class AgentToolExecutor:
             "lines_removed": diff_record["lines_removed"],
             "gdscript_validation": gd_validation,
         }
+
+    _LINE_NUMBER_PREFIX_RE = re.compile(r"^\s*\d+\s\|\s?")
+
+    @classmethod
+    def _strip_line_number_prefixes(cls, search_text: str, replace_text: str) -> Tuple[str, str]:
+        """If the model pasted read_file's '  12 | ' prefixes into its edit, remove them."""
+        s_lines = [ln for ln in search_text.split("\n") if ln.strip()]
+        if s_lines and all(cls._LINE_NUMBER_PREFIX_RE.match(ln) for ln in s_lines):
+            def _clean(text: str) -> str:
+                return "\n".join(cls._LINE_NUMBER_PREFIX_RE.sub("", ln, count=1) for ln in text.split("\n"))
+            return _clean(search_text), _clean(replace_text)
+        return search_text, replace_text
+
+    @staticmethod
+    def _whitespace_tolerant_replace(
+        original: str, search: str, replace: str
+    ) -> Tuple[Optional[str], str]:
+        """
+        Match `search` against `original` line-by-line ignoring leading/trailing whitespace.
+        On exactly one match, substitute `replace`, shifting its indentation to the file's real indentation.
+        Returns (new_text, "") or (None, explanation).
+        """
+        o_lines = original.split("\n")
+        s_lines = search.strip("\n").split("\n")
+        key = [ln.strip() for ln in s_lines]
+        if not any(key):
+            return None, "search_text is empty."
+        n = len(key)
+        hits = [
+            i for i in range(len(o_lines) - n + 1)
+            if [ln.strip() for ln in o_lines[i : i + n]] == key
+        ]
+        if len(hits) > 1:
+            return None, (
+                f"the block matches {len(hits)} places (lines {', '.join(str(h + 1) for h in hits[:5])}). "
+                "Include more surrounding lines so it is unique."
+            )
+        if not hits:
+            first = next(k for k in key if k)
+            near = [i for i, ln in enumerate(o_lines) if ln.strip() == first]
+            if near:
+                i = near[0]
+                actual = "\n".join(o_lines[i : i + n])
+                return None, (
+                    f"the first line was found at line {i + 1} but the following lines differ. "
+                    f"The file actually contains:\n{actual}\nCopy these lines exactly."
+                )
+            return None, "none of these lines exist in the file. Call read_file to see the current content."
+
+        i = hits[0]
+
+        def _indent(ln: str) -> str:
+            return ln[: len(ln) - len(ln.lstrip())]
+
+        k = next(j for j, ln in enumerate(key) if ln)
+        actual_indent = _indent(o_lines[i + k])
+        search_indent = _indent(s_lines[k])
+        new_lines: List[str] = []
+        if replace.strip():
+            for ln in replace.strip("\n").split("\n"):
+                if not ln.strip():
+                    new_lines.append("")
+                elif search_indent and ln.startswith(search_indent):
+                    new_lines.append(actual_indent + ln[len(search_indent):])
+                elif not search_indent:
+                    new_lines.append(actual_indent + ln)
+                else:
+                    new_lines.append(ln)
+        return "\n".join(o_lines[:i] + new_lines + o_lines[i + n :]), ""
+
+    # -------------------------------------------------------------------------
+    # Tool: set_input_action (writes correctly formatted bindings into project.godot)
+    # -------------------------------------------------------------------------
+    _KEY_SPECIAL = 4194304
+    _KEYCODES: Dict[str, int] = {
+        "space": 32, "escape": _KEY_SPECIAL + 1, "esc": _KEY_SPECIAL + 1, "tab": _KEY_SPECIAL + 2,
+        "backspace": _KEY_SPECIAL + 4, "enter": _KEY_SPECIAL + 5, "return": _KEY_SPECIAL + 5,
+        "left": _KEY_SPECIAL + 15, "up": _KEY_SPECIAL + 16, "right": _KEY_SPECIAL + 17, "down": _KEY_SPECIAL + 18,
+        "shift": _KEY_SPECIAL + 21, "ctrl": _KEY_SPECIAL + 22, "control": _KEY_SPECIAL + 22, "alt": _KEY_SPECIAL + 24,
+        **{f"f{i}": 4194304 + 27 + i for i in range(1, 13)},
+    }
+    _MOUSE_BUTTONS: Dict[str, int] = {"left": 1, "right": 2, "middle": 3}
+
+    @classmethod
+    def _resolve_keycode(cls, key_name: str) -> Optional[int]:
+        k = str(key_name).strip().lower().replace("key_", "").replace("arrow", "").replace("_", "").strip()
+        if k in cls._KEYCODES:
+            return cls._KEYCODES[k]
+        if len(k) == 1 and (k.isalpha() or k.isdigit()):
+            return ord(k.upper())
+        return None
+
+    def tool_set_input_action(
+        self, action: str, keys: List[str], mouse_buttons: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        action = action.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]+", action or ""):
+            return {"status": "error", "error": f"Invalid action name '{action}'. Use letters, digits and underscores."}
+        project_file = self.workspace_dir / "project.godot"
+        if not project_file.exists():
+            return {"status": "error", "error": "project.godot not found in the project folder."}
+
+        events: List[str] = []
+        unknown: List[str] = []
+        bound: List[str] = []
+        for key_name in keys or []:
+            code = self._resolve_keycode(key_name)
+            if code is None:
+                unknown.append(str(key_name))
+                continue
+            events.append(
+                'Object(InputEventKey,"resource_local_to_scene":false,"resource_name":"","device":-1,"window_id":0,'
+                '"alt_pressed":false,"shift_pressed":false,"ctrl_pressed":false,"meta_pressed":false,"pressed":false,'
+                f'"keycode":0,"physical_keycode":{code},"key_label":0,"unicode":0,"location":0,"echo":false,"script":null)'
+            )
+            bound.append(str(key_name))
+        for btn in mouse_buttons or []:
+            idx = self._MOUSE_BUTTONS.get(str(btn).strip().lower())
+            if idx is None:
+                unknown.append(f"mouse:{btn}")
+                continue
+            events.append(
+                'Object(InputEventMouseButton,"resource_local_to_scene":false,"resource_name":"","device":-1,"window_id":0,'
+                '"alt_pressed":false,"shift_pressed":false,"ctrl_pressed":false,"meta_pressed":false,"button_mask":0,'
+                '"position":Vector2(0, 0),"global_position":Vector2(0, 0),"factor":1.0,'
+                f'"button_index":{idx},"canceled":false,"pressed":false,"double_click":false,"script":null)'
+            )
+            bound.append(f"mouse:{btn}")
+        if not events:
+            return {
+                "status": "error",
+                "error": f"No valid keys or mouse buttons given (unrecognised: {unknown}). Nothing was changed.",
+            }
+
+        block = f'{action}={{\n"deadzone": 0.5,\n"events": [' + "\n, ".join(events) + "\n]\n}\n"
+        original = project_file.read_text(encoding="utf-8", errors="replace")
+        text = original
+        if not text.endswith("\n"):
+            text += "\n"
+
+        section = re.search(r"^\[input\][ \t]*\n", text, flags=re.MULTILINE)
+        if section is None:
+            text = text.rstrip("\n") + "\n\n[input]\n\n" + block
+        else:
+            body_start = section.end()
+            next_section = re.search(r"^\[[^\]\n]+\][ \t]*$", text[body_start:], flags=re.MULTILINE)
+            body_end = body_start + next_section.start() if next_section else len(text)
+            body = text[body_start:body_end]
+            # An action block runs from `name={` to the first line that is just `}`
+            existing = re.search(
+                rf"^{re.escape(action)}\s*=\s*\{{.*?^\}}[ \t]*\n?", body, flags=re.MULTILINE | re.DOTALL
+            )
+            if existing:
+                body = body[: existing.start()] + block + body[existing.end():]
+            else:
+                body = body.rstrip("\n") + "\n" + block + ("\n" if next_section else "")
+                if not body.startswith("\n"):
+                    body = "\n" + body
+            text = text[:body_start] + body + text[body_end:]
+
+        bak_path = self._create_backup_snapshot(project_file, original)
+        project_file.write_text(text, encoding="utf-8")
+        diff_record = self._record_diff_entry(
+            target=project_file, old_text=original, new_text=text, bak_path=bak_path, operation="set_input_action"
+        )
+        result: Dict[str, Any] = {
+            "status": "success",
+            "action": action,
+            "bound": bound,
+            "res_path": "res://project.godot",
+            "diff_id": diff_record["diff_id"],
+            "note": f'Use it in scripts as Input.is_action_pressed("{action}") / is_action_just_pressed("{action}").',
+        }
+        if unknown:
+            result["ignored_unrecognised"] = unknown
+        return result
 
     # -------------------------------------------------------------------------
     # Tool 5: write_file (with .bak Rollback Snapshot + GDScript Validation)
@@ -1314,24 +1549,36 @@ class AgentToolExecutor:
         if godot_exe and proj_file.exists():
             try:
                 proc_sync = subprocess.run(
-                    [godot_exe, "--headless", "--path", str(self.workspace_dir), "--quit"],
+                    # Run the main scene headless for ~90 frames so runtime errors in _ready/_process surface too
+                    [godot_exe, "--headless", "--path", str(self.workspace_dir), "--quit-after", "90"],
                     cwd=str(self.workspace_dir),
                     capture_output=True,
                     text=True,
-                    timeout=float(min(timeout_sec, 20)),
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=float(max(timeout_sec, 45)),
                 )
-                cli_output = ((proc_sync.stdout or "") + "\n" + (proc_sync.stderr or "")).strip()
-                cli_exit = proc_sync.returncode
-                if "SCRIPT ERROR:" in cli_output or "ERROR:" in cli_output:
-                    for err_line in cli_output.splitlines():
-                        if "ERROR:" in err_line:
-                            diagnostics.append(
-                                {
-                                    "file": "godot-cli",
-                                    "severity": "error",
-                                    "message": err_line.strip(),
-                                }
-                            )
+                raw_lines = ((proc_sync.stdout or "") + "\n" + (proc_sync.stderr or "")).splitlines()
+                # Engine shutdown noise that is not a project problem
+                benign = ("resources still in use at exit", "ObjectDB instances leaked", "at: cleanup (", "at: clear (")
+                kept_lines = [ln for ln in raw_lines if ln.strip() and not any(b in ln for b in benign)]
+                cli_output = "\n".join(kept_lines).strip()
+                seen_msgs: set = set()
+                for li, err_line in enumerate(kept_lines):
+                    if "ERROR:" not in err_line:
+                        continue
+                    msg = err_line.strip()
+                    nxt = kept_lines[li + 1].strip() if li + 1 < len(kept_lines) else ""
+                    if nxt.startswith("at:"):
+                        msg += " " + nxt
+                    if msg in seen_msgs:
+                        continue
+                    seen_msgs.add(msg)
+                    if len(seen_msgs) <= 15:
+                        diagnostics.append({"file": "godot-cli", "severity": "error", "message": msg})
+                cli_exit = proc_sync.returncode if seen_msgs else 0
+            except subprocess.TimeoutExpired:
+                cli_output = "Godot headless run did not exit in time (possible infinite loop in a script)."
             except Exception as exc:
                 logger.debug(f"Godot headless project check CLI fallback: {exc}")
 
@@ -1343,7 +1590,8 @@ class AgentToolExecutor:
         for d in diagnostics:
             loc = f"{d.get('file')}:{d['line']}" if d.get("line") else d.get("file")
             summary_lines.append(f"  ERROR [{loc}]: {d.get('message')}")
-        if cli_output:
+        if cli_output and not valid:
+            summary_lines.append("--- Godot output ---")
             summary_lines.append(cli_output[:1500])
 
         return {
@@ -1355,7 +1603,7 @@ class AgentToolExecutor:
             "checked_scripts": checked_scripts,
             "diagnostics": diagnostics,
             "stdout": "\n".join(summary_lines),
-            "stderr": "" if valid else "\n".join(summary_lines[2:]),
+            "stderr": "",
         }
 
     @staticmethod

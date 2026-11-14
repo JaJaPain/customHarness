@@ -5,6 +5,11 @@ Agentic Coding & 2D/3D Asset-Creation Harness.
 
 from __future__ import annotations
 
+import os
+
+# The end-to-end pipeline test drives the tool loop with the scripted (non-AI) dispatcher.
+os.environ["HARNESS_SCRIPTED_DEMO"] = "1"
+
 import asyncio
 import base64
 import io
@@ -87,7 +92,7 @@ def test_full_async_pipeline():
         # Verify llama-server CLI flags (3-Tier KV Cache Hierarchy: -ngl 99, --cram 8192, --cache-reuse 256, ./cache/kv_disk)
         cmd_tier1 = orch.build_llama_server_command(tier2_overflow=False)
         assert "--slots" in cmd_tier1
-        assert "--cram" in cmd_tier1 and "8192" in cmd_tier1
+        assert "--cache-ram" in cmd_tier1 and "8192" in cmd_tier1
         assert "--cache-reuse" in cmd_tier1 and "256" in cmd_tier1
         assert "-ngl" in cmd_tier1 and "99" in cmd_tier1
         assert "--flash-attn" in cmd_tier1
@@ -97,6 +102,7 @@ def test_full_async_pipeline():
 
         cmd_tier2 = orch.build_llama_server_command(tier2_overflow=True)
         assert "--fit" in cmd_tier2
+        assert "-ngl" not in cmd_tier2
         assert "96000" in cmd_tier2
 
         # Verify Tier 2 Lazy Host-RAM Spillover telemetry ("KV: RAM Spill")

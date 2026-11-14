@@ -97,6 +97,15 @@
       </div>
     </div>
 
+    <!-- LEFT SIDEBAR: saved conversations for the active project -->
+    <aside id="conversations-pane" class="side-drawer conv-pane">
+      <div class="pane-header">
+        <span>CONVERSATIONS</span>
+        <button id="btn-new-chat" class="mini-btn mini-btn-accent" title="Start a new conversation for this project">＋ New</button>
+      </div>
+      <div id="conversation-list" class="conv-list"></div>
+    </aside>
+
     <!-- LEFT SLIDE-OVER DRAWER: Godot 4 Project Explorer & Scene Graph (Hidden by Default for Clean UI) -->
     <aside id="left-drawer" class="side-drawer side-drawer-left hidden">
       <div class="pane-header">
@@ -343,7 +352,7 @@ col.name = "ArmoredCrate-colonly"</textarea>
         </div>
 
         <div class="studio-section">
-          <h4>🧬 3-Tier KV Cache Hierarchy (VRAM &rarr; 8GB --cram &rarr; 15GB NVMe LRU)</h4>
+          <h4>🧬 3-Tier KV Cache Hierarchy (VRAM &rarr; 8GB --cache-ram &rarr; 15GB NVMe LRU)</h4>
           <div class="state-grid" id="kv-tier-grid" style="grid-template-columns: repeat(3, 1fr);">
             <div class="state-node active" data-kv-tier="KV: VRAM">KV: VRAM</div>
             <div class="state-node" data-kv-tier="KV: RAM Spill">KV: RAM Spill</div>

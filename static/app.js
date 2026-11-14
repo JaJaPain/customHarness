@@ -22,8 +22,129 @@ window.addEventListener("DOMContentLoaded", async () => {
     loadWorkspaceTree(),
     inspectWorkspaceFile("res://scenes/main_3d.tscn"),
     loadDiffHistory(),
+    loadChatHistory(),
   ]);
+  const newChatBtn = document.getElementById("btn-new-chat");
+  if (newChatBtn) newChatBtn.addEventListener("click", startNewChat);
 });
+
+// ============================================================================
+// Conversations sidebar (saved chats per project folder)
+// ============================================================================
+function clearChatStream() {
+  const stream = document.getElementById("chat-stream");
+  if (!stream) return;
+  // Keep the first (welcome) card, drop everything else
+  [...stream.querySelectorAll(":scope > .msg")].slice(1).forEach((el) => el.remove());
+}
+
+function renderConversationList(data) {
+  const list = document.getElementById("conversation-list");
+  if (!list) return;
+  const convs = data.conversations || [];
+  const activeSaved = convs.some((c) => c.id === data.active_id);
+  let html = "";
+  if (!activeSaved) {
+    html += `<div class="conv-item active"><div class="conv-item-text"><div class="conv-item-title">New conversation</div><div class="conv-item-meta">not saved yet</div></div></div>`;
+  }
+  html += convs
+    .map(
+      (c) => `
+      <div class="conv-item ${c.id === data.active_id ? "active" : ""}" data-conv-id="${escapeHtml(c.id)}" title="${escapeHtml(c.title)}">
+        <div class="conv-item-text">
+          <div class="conv-item-title">${escapeHtml(c.title)}</div>
+          <div class="conv-item-meta">${escapeHtml((c.updated_at || "").slice(5, 16))} · ${c.message_count} msg</div>
+        </div>
+        <button class="conv-item-delete" data-conv-delete="${escapeHtml(c.id)}" title="Delete conversation">✕</button>
+      </div>`
+    )
+    .join("");
+  list.innerHTML = html || `<div class="conv-empty">No conversations yet.</div>`;
+
+  list.querySelectorAll("[data-conv-id]").forEach((el) => {
+    el.addEventListener("click", (evt) => {
+      if (evt.target.closest("[data-conv-delete]")) return;
+      conversationAction("/api/conversations/select", { id: el.dataset.convId });
+    });
+  });
+  list.querySelectorAll("[data-conv-delete]").forEach((el) => {
+    el.addEventListener("click", (evt) => {
+      evt.stopPropagation();
+      if (confirm("Delete this conversation? This cannot be undone.")) {
+        conversationAction("/api/conversations/delete", { id: el.dataset.convDelete });
+      }
+    });
+  });
+}
+
+function renderChatFromHistory(data) {
+  const stream = document.getElementById("chat-stream");
+  if (!stream) return;
+  clearChatStream();
+  (data.messages || []).forEach((m) => {
+    const div = document.createElement("div");
+    if (m.role === "user") {
+      div.className = "msg msg-user";
+      div.innerHTML = `
+        <div class="msg-header"><span class="msg-role">YOU</span><span class="msg-meta">earlier</span></div>
+        <div class="msg-body">${escapeHtml(m.content || "")}</div>`;
+    } else {
+      const tools = (m.tools || []).filter(Boolean);
+      div.className = "msg msg-assistant";
+      div.innerHTML = `
+        <div class="msg-header">
+          <span class="msg-role">GODOT 4 HARNESS</span>
+          <span class="msg-meta">${tools.length ? `${tools.length} tool call${tools.length > 1 ? "s" : ""} · ` : ""}earlier</span>
+        </div>
+        <div class="msg-body">${formatMarkdownLite(m.content || "")}</div>`;
+    }
+    stream.appendChild(div);
+  });
+  if (stream.lastElementChild) stream.lastElementChild.scrollIntoView({ block: "end" });
+}
+
+async function loadChatHistory() {
+  try {
+    const res = await fetch("/api/conversations");
+    const data = await res.json();
+    renderConversationList(data);
+    renderChatFromHistory(data);
+  } catch (err) {
+    console.error("Could not load conversations:", err);
+  }
+}
+
+async function refreshConversationList() {
+  try {
+    const res = await fetch("/api/conversations");
+    renderConversationList(await res.json());
+  } catch (err) {
+    console.error("Could not refresh conversations:", err);
+  }
+}
+
+async function conversationAction(url, body = null) {
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : null,
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.detail || "Could not change conversation.");
+      return;
+    }
+    renderConversationList(data);
+    renderChatFromHistory(data);
+  } catch (err) {
+    console.error("Conversation action failed:", err);
+  }
+}
+
+function startNewChat() {
+  conversationAction("/api/conversations/new");
+}
 
 function initWebSocket() {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -38,6 +159,9 @@ function initWebSocket() {
         updateTelemetryUI(msg.data);
       } else if (msg.type === "step_start") {
         handleLiveStepStart(msg.data);
+      } else if (msg.type === "llm_status") {
+        const statusHeader = document.getElementById("active-progress-header");
+        if (statusHeader && msg.data?.message) statusHeader.textContent = msg.data.message;
       } else if (msg.type === "tool_start") {
         handleLiveToolStart(msg.data);
       } else if (msg.type === "tool_complete") {
@@ -50,6 +174,7 @@ function initWebSocket() {
         if (msg.data?.workspace_dir) updateWorkspaceBadge(msg.data.workspace_dir);
         loadWorkspaceTree();
         loadDiffHistory();
+        loadChatHistory();
       }
     } catch (err) {
       console.error("WS parse error:", err);
@@ -1119,7 +1244,7 @@ async function sendChatPrompt(promptText, simulateContextTokens = null) {
       assistantCard.scrollIntoView({ behavior: "smooth", block: "start" });
     }
     if (data.vram_telemetry) updateTelemetryUI(data.vram_telemetry);
-    await Promise.all([loadWorkspaceTree(), loadDiffHistory()]);
+    await Promise.all([loadWorkspaceTree(), loadDiffHistory(), refreshConversationList()]);
   } catch (err) {
     console.error("Chat error:", err);
     const existingProg = document.getElementById("active-progress-card");

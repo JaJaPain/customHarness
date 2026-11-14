@@ -497,10 +497,10 @@ class ProjectMemoryRAG:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 320,
+            "max_tokens": 1200,
         }
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(url, json=payload)
                 if resp.status_code == 200:
                     content = resp.json()["choices"][0]["message"].get("content", "")

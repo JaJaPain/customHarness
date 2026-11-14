@@ -401,12 +401,12 @@ class VRAMOrchestrator:
       - GODOT_YIELDED (Tier 5: Godot_v4* child preview >2.5GB VRAM -> yield GPU)
     """
 
-    VRAM_KV_CEILING_TOKENS = 16384         # Threshold where --cram 8192 begins spilling older KV blocks to host RAM
+    VRAM_KV_CEILING_TOKENS = 16384         # Threshold where --cache-ram 8192 begins spilling older KV blocks to host RAM
     PRE_COMPACTION_FLUSH_THRESHOLD_TOKENS = 25000  # Trigger pre-compaction memory flush at ~25,000 tokens
     TIER2_OVERFLOW_THRESHOLD_TOKENS = 26000
     TIER3_REQUIRED_FREE_VRAM_MB = 10752.0  # 10.5 GB
     TIER5_GODOT_VRAM_YIELD_MB = 2560.0     # 2.5 GB
-    CRAM_POOL_MB = 8192                    # 8 GB host-RAM prompt cache pool (--cram 8192)
+    CRAM_POOL_MB = 8192                    # 8 GB host-RAM prompt cache pool (--cache-ram 8192)
     CACHE_REUSE_TOKENS = 256               # Automatic KV prefix reuse chunk (--cache-reuse 256)
     SLOT_FILENAME = "active_session.bin"
     SESSION_FALLBACK_JSON = "active_session.json"
@@ -465,6 +465,9 @@ class VRAMOrchestrator:
         self._on_state_change = on_state_change
 
         self._llama_process: Optional[subprocess.Popen] = None
+        self._last_llama_launch_error: Optional[str] = None
+        # True while an agent turn is running: the Godot play-mode monitor must not unload the LLM mid-turn
+        self.agent_turn_active: bool = False
         self._sd_process: Optional[subprocess.Popen] = None
 
         self._nvml_initialized = False
@@ -764,7 +767,7 @@ class VRAMOrchestrator:
         """
         Construct the llama-server.exe command line implementing the 3-Tier KV Cache Hierarchy:
           - Tier 1 (VRAM First): -ngl 99 pins 100% of model weights + active q8_0 KV cache in 12GB VRAM.
-          - Tier 2 (Lazy Host-RAM Spillover): --cram 8192 (8GB host-RAM prompt cache pool) + --cache-reuse 256
+          - Tier 2 (Lazy Host-RAM Spillover): --cache-ram 8192 (8GB host-RAM prompt cache pool) + --cache-reuse 256
             spills older KV prefix blocks into system RAM only when approaching the VRAM ceiling.
           - Tier 3 (NVMe Disk Persistence): --slots --slot-save-path ./cache/kv_disk
         """
@@ -785,9 +788,7 @@ class VRAMOrchestrator:
             "127.0.0.1",
             "--port",
             str(self.llama_port),
-            "-ngl",
-            "99",
-            "--cram",
+            "--cache-ram",
             str(self.CRAM_POOL_MB),
             "--cache-reuse",
             str(self.CACHE_REUSE_TOKENS),
@@ -809,7 +810,8 @@ class VRAMOrchestrator:
             cmd.extend(["--mmproj", str(mmproj_path)])
 
         if tier2_overflow:
-            # Extreme Context Overflow (96,000-token context window with --fit on + --cram 8192)
+            # Extreme Context Overflow: 96,000-token window. -ngl is deliberately NOT set so that
+            # --fit on can decide how many layers stay in VRAM and spill the rest to system RAM.
             cmd.extend([
                 "--fit",
                 "on",
@@ -817,8 +819,10 @@ class VRAMOrchestrator:
                 str(profile.overflow_ctx_tier2),
             ])
         else:
-            # Tier 1 / Tier 2 Lazy Host-RAM Spillover (32,768 context window with -ngl 99 + --cram 8192)
+            # Tier 1 Fast VRAM Mode: all layers on the GPU, 32,768-token window
             cmd.extend([
+                "-ngl",
+                "99",
                 "-c",
                 str(profile.default_ctx_tier1),
             ])
@@ -898,7 +902,7 @@ class VRAMOrchestrator:
                 if self.state != EngineState.HYBRID_RAM_OVERFLOW:
                     await self._enter_tier2_overflow_unlocked(estimated)
             elif estimated > self.VRAM_KV_CEILING_TOKENS:
-                # Active context approaches VRAM ceiling -> --cram 8192 spills older KV prefix blocks to host RAM
+                # Active context approaches VRAM ceiling -> --cache-ram 8192 spills older KV prefix blocks to host RAM
                 self._kv_cache_tier = KVCacheTier.RAM_SPILL
                 self._just_restored_from_disk = False
                 if self.state == EngineState.LLM_ACTIVE:
@@ -920,16 +924,69 @@ class VRAMOrchestrator:
                 "pre_compaction_flush": flush_meta,
             }
 
+    LLAMA_STARTUP_TIMEOUT_SEC = 300.0  # cold-loading ~8.5 GB of weights from disk takes 1-2 minutes
+
+    def is_llama_alive(self) -> bool:
+        return self._llama_process is not None and self._llama_process.poll() is None
+
+    def _read_llama_log_tail(self, max_lines: int = 12) -> str:
+        try:
+            log_file = self.logs_dir / "llama_server.log"
+            lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            return "\n".join(line for line in lines[-max_lines:] if line.strip())
+        except Exception:
+            return ""
+
+    def describe_llm_unavailable(self) -> str:
+        """Human-readable reason the local model is not running (shown in the chat instead of a fake reply)."""
+        llama_exe = self.get_llama_server_path()
+        model_path = self.models_dir / self.active_profile.model_filename
+        if not llama_exe.exists():
+            return (
+                f"`llama-server.exe` was not found in `{self.bin_dir}`. "
+                "Open **Setup / Downloads** and install the llama.cpp CUDA binaries."
+            )
+        if not model_path.exists():
+            return (
+                f"The model file `{model_path.name}` is missing from `{self.models_dir}`. "
+                "Open **Setup / Downloads** and download it."
+            )
+        if self._last_llama_launch_error:
+            return self._last_llama_launch_error
+        if self.state not in (EngineState.LLM_ACTIVE, EngineState.HYBRID_RAM_OVERFLOW):
+            return (
+                f"The model is currently unloaded (engine state: {self.state.value}). "
+                "Send the message again in a moment."
+            )
+        return "llama-server is not running. See `cache/logs/llama_server.log` for details."
+
+    def _kill_stale_llama_on_port(self) -> None:
+        """A llama-server left over from a crashed harness run would block our port - remove it."""
+        try:
+            for conn in psutil.net_connections(kind="inet"):
+                if conn.laddr and conn.laddr.port == self.llama_port and conn.status == "LISTEN" and conn.pid:
+                    try:
+                        proc = psutil.Process(conn.pid)
+                        if "llama-server" in proc.name().lower():
+                            logger.info(f"Stopping stale llama-server (PID {conn.pid}) on port {self.llama_port}")
+                            proc.terminate()
+                            proc.wait(timeout=6.0)
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.debug(f"Stale llama-server check skipped: {exc}")
+
     async def _ensure_llama_subprocess_alive_unlocked(
         self, tier2_overflow: bool = False
     ) -> bool:
-        """Start or self-heal llama-server.exe if binary & weights exist on disk."""
+        """Start or self-heal llama-server.exe and wait until the model has actually finished loading."""
         if not self.is_llama_binary_and_model_present():
             return False
 
-        if self._llama_process is not None and self._llama_process.poll() is None:
+        if self.is_llama_alive():
             return True
 
+        self._kill_stale_llama_on_port()
         cmd = self.build_llama_server_command(tier2_overflow=tier2_overflow)
         log_file = self.logs_dir / "llama_server.log"
         logger.info(f"Launching llama-server.exe: {' '.join(cmd)}")
@@ -937,7 +994,7 @@ class VRAMOrchestrator:
             creationflags = (
                 subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             )
-            with open(log_file, "a", encoding="utf-8") as lf:
+            with open(log_file, "w", encoding="utf-8") as lf:
                 self._llama_process = subprocess.Popen(
                     cmd,
                     cwd=str(self.base_dir),
@@ -945,14 +1002,33 @@ class VRAMOrchestrator:
                     stderr=subprocess.STDOUT,
                     creationflags=creationflags,
                 )
-            await self._wait_for_llama_health(timeout_sec=45.0)
-            return True
         except Exception as exc:
-            logger.warning(f"Failed to start llama-server.exe subprocess: {exc}")
+            self._last_llama_launch_error = f"Could not start llama-server.exe: {exc}"
+            logger.warning(self._last_llama_launch_error)
             self._llama_process = None
             return False
 
-    async def _wait_for_llama_health(self, timeout_sec: float = 45.0) -> bool:
+        healthy = await self._wait_for_llama_health(timeout_sec=self.LLAMA_STARTUP_TIMEOUT_SEC)
+        if healthy:
+            self._last_llama_launch_error = None
+            logger.info("llama-server.exe is loaded and healthy.")
+            return True
+
+        exited = self._llama_process is None or self._llama_process.poll() is not None
+        tail = self._read_llama_log_tail()
+        reason = (
+            "llama-server.exe exited during startup."
+            if exited
+            else f"llama-server.exe did not finish loading within {int(self.LLAMA_STARTUP_TIMEOUT_SEC)}s."
+        )
+        if tail:
+            reason += f" Last log lines (`cache/logs/llama_server.log`):\n```\n{tail}\n```"
+        self._last_llama_launch_error = reason
+        logger.warning(reason)
+        self._terminate_llama_process()
+        return False
+
+    async def _wait_for_llama_health(self, timeout_sec: float = 300.0) -> bool:
         deadline = time.monotonic() + timeout_sec
         url = f"http://127.0.0.1:{self.llama_port}/health"
         async with httpx.AsyncClient(timeout=2.0) as client:
@@ -965,7 +1041,7 @@ class VRAMOrchestrator:
                         return True
                 except Exception:
                     pass
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(0.5)
         return False
 
     def _terminate_llama_process(self) -> None:
@@ -1167,7 +1243,7 @@ class VRAMOrchestrator:
         self._kv_cache_tier = KVCacheTier.RAM_SPILL
         self._set_state(
             EngineState.HYBRID_RAM_OVERFLOW,
-            f"Context ({estimated_tokens} tokens) exceeded 26,000 threshold -> hot-swapping llama-server with --fit on -c 96000 --cram 8192 (KV: RAM Spill)",
+            f"Context ({estimated_tokens} tokens) exceeded 26,000 threshold -> hot-swapping llama-server with --fit on -c 96000 --cache-ram 8192 (KV: RAM Spill)",
         )
         await self.save_kv_slot()
         self._terminate_llama_process()
@@ -1487,7 +1563,9 @@ class VRAMOrchestrator:
                 current_state = self.state
 
                 # Tier 5 check: Godot_v4* child game preview consuming > 2.5 GB (2560 MB)
-                if (
+                if self.agent_turn_active:
+                    pass  # an agent turn owns the GPU right now; re-evaluate once it finishes
+                elif (
                     current_state in (EngineState.LLM_ACTIVE, EngineState.HYBRID_RAM_OVERFLOW)
                     and stats.godot_preview_vram_mb >= self.TIER5_GODOT_VRAM_YIELD_MB
                 ):

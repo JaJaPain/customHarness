@@ -17,7 +17,7 @@ import uuid
 import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -59,6 +59,11 @@ STATIC_DIR = BASE_DIR / "static"
 
 def _load_persisted_workspace_dir() -> Path:
     """Load the user's last selected project folder from ./cache/workspace_config.json if available."""
+    env_override = os.environ.get("HARNESS_WORKSPACE_DIR")
+    if env_override:
+        p = Path(env_override).resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
     try:
         if WORKSPACE_CONFIG_FILE.exists():
             data = json.loads(WORKSPACE_CONFIG_FILE.read_text(encoding="utf-8"))
@@ -265,24 +270,39 @@ tool_executor = AgentToolExecutor(
     audio_worker=audio_worker,
 )
 
-BASE_SYSTEM_PROMPT = (
-    "You are the Ornith-1.5-9B Local Godot 4 Agentic Coding & 2D/3D Asset-Creation Harness. "
-    "You run locally on an NVIDIA RTX 3060 12GB VRAM + 32GB DDR4 RAM Windows 11 workstation. "
-    "Always enclose internal reasoning in <think>...</think> tags before calling tools or writing code. "
-    "When creating 2D textures/sprites with `generate_2d_asset` or 3D `.glb` assets with `run_blender_script`, "
-    "inspect the returned Closed-Loop Vision Self-Check image or 3-Angle Visual Verification Contact Sheet "
-    "before integrating the asset into Godot 4 `.tscn` scenes or `.gd` scripts. "
-    "Use `recall_memory(query, top_k=4)` whenever you need to recall archived session turns, debugging steps, "
-    "or Godot 4 project architecture decisions."
-)
+BASE_SYSTEM_PROMPT = """You are a local Godot 4 game-development agent running inside the user's Godot project folder. You work by calling tools, then reporting what you actually did.
 
-# Conversation session state (System Prompt + pinned .harness/MEMORY.md kept static at index 0 for KV cache reuse)
-CONVERSATION_HISTORY: List[Dict[str, Any]] = [
-    {
-        "role": "system",
-        "content": orchestrator.memory_rag.build_static_system_prompt(BASE_SYSTEM_PROMPT),
-    }
-]
+HOW TO WORK
+1. Understand the request. If the user reports a bug or shows a screenshot, the problem is in THIS project - investigate it; never answer with a generic capability summary.
+2. Look before you change: use list_dir / grep_search / read_file to inspect the relevant scenes (.tscn), scripts (.gd) and project.godot. Each user message ends with an up-to-date list of the project files.
+3. Make the change with apply_diff (small targeted edits; search_text must match the file exactly) or write_file (new files / full rewrites).
+4. Verify: after editing, call run_command with `godot --headless --quit` to validate the whole project, read any errors, and fix them. Do not say something works unless a tool result shows it.
+5. Finish with a short plain-language summary: what was wrong, what you changed (file paths), and anything the user should test by hand.
+
+RULES
+- All paths are Godot `res://` paths relative to the project root.
+- Target Godot 4.x / GDScript 2.0 (`@export`, `@onready`, `CharacterBody3D`, `signal.connect(callable)`, `await`). Never use Godot 3 syntax.
+- Every input action a script uses (Input.is_action_pressed etc.) must be bound to keys with the set_input_action tool - never hand-edit the [input] section of project.godot. An action with empty events never fires. Scripts must also be attached to nodes in the scene, or nothing happens at runtime.
+- Keep working with tools until the task is done; do not stop after only reading a file. If you are blocked, say exactly what is blocking you.
+- Earlier turns of this conversation are real: when the user says "it", "the game", or "that", they mean the project and work discussed above.
+
+ASSET TOOLS
+- generate_2d_asset (textures, sprites, icons), run_blender_script (3D .glb models) and generate_game_audio (sfx / music loops) each return a preview image (picture, 3-angle contact sheet, or waveform + spectrogram). Look at the preview and regenerate if it is wrong before wiring the asset into scenes or scripts.
+- recall_memory searches archived earlier sessions and pinned project facts when you need a detail that is no longer in the conversation."""
+
+
+def _fresh_history() -> List[Dict[str, Any]]:
+    """System prompt + pinned .harness/MEMORY.md kept static at index 0 for KV prefix-cache reuse."""
+    return [
+        {
+            "role": "system",
+            "content": orchestrator.memory_rag.build_static_system_prompt(BASE_SYSTEM_PROMPT),
+        }
+    ]
+
+
+# Conversation state for the active project (persisted to <project>/.harness/chat_history.json)
+CONVERSATION_HISTORY: List[Dict[str, Any]] = _fresh_history()
 
 
 @asynccontextmanager
@@ -294,8 +314,15 @@ async def lifespan(app: FastAPI):
         t = threading.Timer(0.8, lambda: webbrowser.open("http://127.0.0.1:8000"))
         t.daemon = True
         t.start()
+    warmup_task = None
+    if not _scripted_demo_enabled() and orchestrator.is_llama_binary_and_model_present():
+        # Load the model in the background right away so the first prompt does not wait for it
+        warmup_task = asyncio.create_task(orchestrator.ensure_llm_ready())
     yield
-    await orchestrator.shutdown_and_persist(CONVERSATION_HISTORY)
+    if warmup_task and not warmup_task.done():
+        warmup_task.cancel()
+    _persist_history()
+    await orchestrator.shutdown_and_persist(_strip_images_for_disk(CONVERSATION_HISTORY))
 
 
 app = FastAPI(
@@ -319,7 +346,7 @@ class ChatRequest(BaseModel):
     prompt: str
     attachments: List[Dict[str, Any]] = Field(default_factory=list)
     simulate_context_tokens: Optional[int] = None
-    max_steps: int = 12
+    max_steps: int = 30
 
 
 class ToolCallRequest(BaseModel):
@@ -371,6 +398,10 @@ class MemoryRecallRequest(BaseModel):
     top_k: int = 4
 
 
+class ConversationRequest(BaseModel):
+    id: str
+
+
 class WorkspaceSelectRequest(BaseModel):
     folder_path: str
     init_starter_if_empty: bool = False
@@ -387,124 +418,599 @@ class WorkspaceMkdirRequest(BaseModel):
 
 
 # =============================================================================
-# Core Agentic Loop + Local Fallback Synthesis
+# Conversations (each Godot project folder keeps its own list of saved chats)
+#   <project>/.harness/conversations/<id>.json   one file per conversation
+#   <project>/.harness/conversations/active.txt  id of the conversation that is open
 # =============================================================================
-def _compact_tool_result_for_history(result: Dict[str, Any]) -> str:
-    """Serialize tool result for CONVERSATION_HISTORY without duplicating multi-megabyte base64 strings."""
-    cleaned: Dict[str, Any] = {}
-    for k, v in result.items():
-        if k in ("closed_loop_vision_check", "contact_sheet") and isinstance(v, dict):
-            cleaned[k] = {
-                ck: ("[base64_image_attached_in_vision_turn]" if ck == "image_url" else cv)
-                for ck, cv in v.items()
-            }
+TURN_LOCK = asyncio.Lock()
+_last_project_context_sig: Optional[str] = None
+ACTIVE_CONVERSATION: Dict[str, Any] = {"id": "", "title": "New conversation", "created_at": ""}
+
+
+def _conversations_dir(workspace: Optional[Path] = None) -> Path:
+    return (workspace or tool_executor.workspace_dir) / ".harness" / "conversations"
+
+
+def _new_conversation_id() -> str:
+    return time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+
+
+def _strip_images_for_disk(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Replace base64 image parts with a short text marker so the saved chat stays small."""
+    out: List[Dict[str, Any]] = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            parts = [
+                {"type": "text", "text": "[image shown earlier - not kept across restarts]"}
+                if isinstance(part, dict) and part.get("type") == "image_url"
+                else part
+                for part in content
+            ]
+            m = {**m, "content": parts}
+        out.append(m)
+    return out
+
+
+def _derive_title(messages: List[Dict[str, Any]]) -> str:
+    for m in messages:
+        if m.get("role") == "user" and not m.get("synthetic"):
+            text = m.get("display_text")
+            if text is None:
+                content = m.get("content")
+                text = content if isinstance(content, str) else ""
+            text = " ".join(str(text).split())
+            if text:
+                return text[:60] + ("..." if len(text) > 60 else "")
+    return "New conversation"
+
+
+def _persist_history(workspace: Optional[Path] = None) -> None:
+    """Save the open conversation so a restart, project switch or chat switch never wipes the agent's context."""
+    try:
+        messages = [m for m in CONVERSATION_HISTORY if m.get("role") != "system"]
+        if not messages or not ACTIVE_CONVERSATION["id"]:
+            return  # nothing said yet: do not litter the list with empty chats
+        conv_dir = _conversations_dir(workspace)
+        conv_dir.mkdir(parents=True, exist_ok=True)
+        if ACTIVE_CONVERSATION["title"] == "New conversation":
+            ACTIVE_CONVERSATION["title"] = _derive_title(messages)
+        payload = {
+            "id": ACTIVE_CONVERSATION["id"],
+            "title": ACTIVE_CONVERSATION["title"],
+            "created_at": ACTIVE_CONVERSATION["created_at"],
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "messages": _strip_images_for_disk(messages),
+        }
+        path = conv_dir / f"{ACTIVE_CONVERSATION['id']}.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+        (conv_dir / "active.txt").write_text(ACTIVE_CONVERSATION["id"], encoding="utf-8")
+    except Exception as exc:
+        logger.warning(f"Could not persist conversation: {exc}")
+
+
+def _list_conversations() -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    conv_dir = _conversations_dir()
+    if conv_dir.exists():
+        for f in conv_dir.glob("*.json"):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                items.append(
+                    {
+                        "id": data.get("id") or f.stem,
+                        "title": data.get("title") or "Untitled",
+                        "updated_at": data.get("updated_at") or "",
+                        "message_count": sum(
+                            1 for m in data.get("messages", [])
+                            if m.get("role") == "user" and not m.get("synthetic")
+                        ),
+                    }
+                )
+            except Exception:
+                continue
+    items.sort(key=lambda c: c["updated_at"], reverse=True)
+    return items
+
+
+def _start_new_conversation() -> None:
+    """Open a blank conversation (it is only written to disk once something is said)."""
+    global _last_project_context_sig
+    _last_project_context_sig = None
+    ACTIVE_CONVERSATION.update(
+        id=_new_conversation_id(),
+        title="New conversation",
+        created_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    orchestrator.conversation_id = ACTIVE_CONVERSATION["id"]
+    CONVERSATION_HISTORY.clear()
+    CONVERSATION_HISTORY.extend(_fresh_history())
+
+
+def _open_conversation(conv_id: str) -> bool:
+    """Load a saved conversation into CONVERSATION_HISTORY. Returns False if it does not exist."""
+    global _last_project_context_sig
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", conv_id or ""):
+        return False
+    path = _conversations_dir() / f"{conv_id}.json"
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(f"Could not read conversation {path}: {exc}")
+        return False
+    restored = [
+        m for m in data.get("messages", [])
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant", "tool", "system")
+    ]
+    _last_project_context_sig = None
+    ACTIVE_CONVERSATION.update(
+        id=conv_id,
+        title=data.get("title") or "Untitled",
+        created_at=data.get("created_at") or "",
+    )
+    orchestrator.conversation_id = conv_id
+    CONVERSATION_HISTORY.clear()
+    CONVERSATION_HISTORY.extend(_fresh_history())
+    CONVERSATION_HISTORY.extend(restored)
+    try:
+        (_conversations_dir() / "active.txt").write_text(conv_id, encoding="utf-8")
+    except Exception:
+        pass
+    logger.info(f"Opened conversation '{ACTIVE_CONVERSATION['title']}' ({len(restored)} messages)")
+    return True
+
+
+def _load_history_from_disk() -> None:
+    """On startup / project switch: reopen the conversation that was last open for this project."""
+    conv_dir = _conversations_dir()
+    last_id = ""
+    try:
+        last_id = (conv_dir / "active.txt").read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    if last_id and _open_conversation(last_id):
+        return
+    existing = _list_conversations()
+    if existing and _open_conversation(existing[0]["id"]):
+        return
+    _start_new_conversation()
+
+
+def _history_for_ui() -> List[Dict[str, Any]]:
+    """Flatten stored messages into simple user / assistant cards for the chat panel."""
+    cards: List[Dict[str, Any]] = []
+    for m in CONVERSATION_HISTORY:
+        role = m.get("role")
+        if role == "user" and not m.get("synthetic"):
+            text = m.get("display_text")
+            if text is None:
+                content = m.get("content")
+                if isinstance(content, list):
+                    text = " ".join(
+                        p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                else:
+                    text = str(content or "")
+            cards.append({"role": "user", "content": text})
+        elif role == "assistant":
+            text = str(m.get("content") or "")
+            tool_names = [
+                (tc.get("function") or {}).get("name", "") for tc in (m.get("tool_calls") or [])
+            ]
+            if cards and cards[-1]["role"] == "assistant":
+                # Merge the steps of one agent turn into a single card
+                if text:
+                    cards[-1]["content"] = (cards[-1]["content"] + "\n\n" + text).strip()
+                cards[-1]["tools"].extend(tool_names)
+            else:
+                cards.append({"role": "assistant", "content": text, "tools": tool_names})
+    return cards
+
+
+_load_history_from_disk()
+
+
+# =============================================================================
+# Project Context (keeps a small model oriented in the user's project)
+# =============================================================================
+_CODE_SUFFIXES = {".gd", ".tscn", ".tres", ".gdshader", ".godot", ".cfg", ".json", ".txt", ".md", ".cs"}
+_ASSET_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".svg", ".glb", ".gltf", ".obj", ".wav", ".ogg", ".mp3", ".ttf", ".otf"}
+
+
+def _build_project_context() -> str:
+    """Compact, current listing of the active project so the model knows what exists without guessing."""
+    root = tool_executor.workspace_dir
+    code_files: List[str] = []
+    asset_files: List[str] = []
+    try:
+        for p in sorted(root.rglob("*")):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(root)
+            if any(part.startswith(".") or part in ("blend_src", "__pycache__") for part in rel.parts):
+                continue
+            suffix = p.suffix.lower()
+            res = "res://" + str(rel).replace("\\", "/")
+            if suffix in _CODE_SUFFIXES:
+                code_files.append(res)
+            elif suffix in _ASSET_SUFFIXES:
+                asset_files.append(res)
+    except Exception as exc:
+        logger.debug(f"Project context scan failed: {exc}")
+
+    main_scene = None
+    project_file = root / "project.godot"
+    if project_file.exists():
+        try:
+            m = re.search(
+                r'^run/main_scene\s*=\s*"([^"]+)"',
+                project_file.read_text(encoding="utf-8", errors="replace"),
+                flags=re.MULTILINE,
+            )
+            main_scene = m.group(1) if m else None
+        except Exception:
+            pass
+
+    def _cap(items: List[str], limit: int) -> str:
+        if not items:
+            return "(none)"
+        shown = ", ".join(items[:limit])
+        return shown + (f", ... and {len(items) - limit} more" if len(items) > limit else "")
+
+    return (
+        "--- Project Context (auto-generated, current state of the project on disk) ---\n"
+        f"Project folder: {root}\n"
+        f"Main scene: {main_scene or '(not set in project.godot)'}\n"
+        f"Scenes, scripts & config: {_cap(code_files, 80)}\n"
+        f"Assets: {_cap(asset_files, 40)}"
+    )
+
+
+# =============================================================================
+# LLM Transport (llama-server.exe OpenAI-compatible API)
+# =============================================================================
+class LLMUnavailableError(RuntimeError):
+    """The local model could not be reached; the message is shown to the user verbatim."""
+
+
+class LLMContextOverflowError(RuntimeError):
+    """The prompt no longer fits the loaded context window."""
+
+
+def _scripted_demo_enabled() -> bool:
+    return os.environ.get("HARNESS_SCRIPTED_DEMO") == "1"
+
+
+def _messages_for_api(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Convert stored history into a strictly valid OpenAI chat sequence:
+      - only API fields are sent (no UI-only keys such as `thinking` / `display_text`),
+      - assistant `tool_calls` are preserved and every call is answered by a `tool` message
+        carrying the matching `tool_call_id`,
+      - orphaned tool results (e.g. after compaction) are dropped,
+      - late system messages (compaction summaries) are sent as user messages, since most
+        chat templates only allow a system message at position 0.
+    """
+    staged: List[Dict[str, Any]] = []
+    open_ids: set = set()
+    for m in history:
+        role = m.get("role")
+        content = m.get("content")
+        if content is None:
+            content = ""
+        if role == "system":
+            staged.append({"role": "user" if staged else "system", "content": content})
+            open_ids = set()
+        elif role == "user":
+            staged.append({"role": "user", "content": content})
+            open_ids = set()
+        elif role == "assistant":
+            tool_calls = m.get("tool_calls") or []
+            if not tool_calls and not content:
+                continue
+            msg: Dict[str, Any] = {"role": "assistant", "content": content}
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+            open_ids = {tc.get("id") for tc in tool_calls}
+            staged.append(msg)
+        elif role == "tool":
+            tid = m.get("tool_call_id")
+            if tid in open_ids:
+                staged.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tid,
+                        "content": content if isinstance(content, str) else json.dumps(content),
+                    }
+                )
+
+    fixed: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(staged):
+        m = staged[i]
+        fixed.append(m)
+        i += 1
+        if m["role"] == "assistant" and m.get("tool_calls"):
+            answered: set = set()
+            while i < len(staged) and staged[i]["role"] == "tool":
+                fixed.append(staged[i])
+                answered.add(staged[i]["tool_call_id"])
+                i += 1
+            for tc in m["tool_calls"]:
+                if tc.get("id") not in answered:
+                    fixed.append(
+                        {"role": "tool", "tool_call_id": tc.get("id"), "content": "[tool was not executed]"}
+                    )
+    return fixed
+
+
+async def _call_llm(
+    messages: List[Dict[str, Any]],
+    user_prompt: str,
+    step_index: int,
+    executed_tools: List[Dict[str, Any]],
+) -> Tuple[str, str, Optional[List[Dict[str, Any]]], str]:
+    """
+    Ask the local model for the next step. Returns (content, reasoning, tool_calls, finish_reason).
+    Raises LLMUnavailableError with a human-readable reason instead of ever inventing a reply.
+    """
+    if _scripted_demo_enabled():
+        from scripted_demo import _synthesize_local_agent_response
+
+        text, calls = _synthesize_local_agent_response(
+            user_prompt=user_prompt, step_index=step_index, executed_tools=executed_tools
+        )
+        return text, "", calls, "stop"
+
+    if not orchestrator.is_llama_alive():
+        raise LLMUnavailableError(orchestrator.describe_llm_unavailable())
+
+    url = f"http://127.0.0.1:{orchestrator.llama_port}/v1/chat/completions"
+    payload = {
+        "model": orchestrator.active_profile.model_filename,
+        "messages": _messages_for_api(messages),
+        "tools": TOOL_DEFINITIONS,
+        "temperature": 0.2,
+        "max_tokens": 8192,
+    }
+    try:
+        # Local generation of a long file can take minutes on a 12GB GPU - never time out early.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=10.0)) as client:
+            resp = await client.post(url, json=payload)
+    except Exception as exc:
+        raise LLMUnavailableError(
+            f"The request to the local model (llama-server on port {orchestrator.llama_port}) failed: "
+            f"{type(exc).__name__}: {exc}. {orchestrator.describe_llm_unavailable()}"
+        ) from exc
+
+    if resp.status_code != 200:
+        body = resp.text[:800]
+        if "context" in body.lower() and ("exceed" in body.lower() or "too large" in body.lower()):
+            raise LLMContextOverflowError(body)
+        raise LLMUnavailableError(
+            f"llama-server rejected the request (HTTP {resp.status_code}): {body}"
+        )
+
+    data = resp.json()
+    choice = data["choices"][0]
+    message = choice.get("message") or {}
+    return (
+        message.get("content") or "",
+        message.get("reasoning_content") or "",
+        message.get("tool_calls"),
+        choice.get("finish_reason") or "stop",
+    )
+
+
+# =============================================================================
+# Core Agentic Loop
+# =============================================================================
+_MAX_TOOL_RESULT_CHARS = 14000
+
+
+def _format_tool_result_for_model(tool_name: str, result: Dict[str, Any]) -> str:
+    """Render a tool result the way a small model reads best: plain text for files, trimmed JSON otherwise."""
+    if tool_name == "read_file" and result.get("status") == "success":
+        header = (
+            f"[read_file {result.get('res_path')} lines {result.get('start_line')}-{result.get('end_line')} "
+            f"of {result.get('total_lines')}]"
+        )
+        parts = [header]
+        res_path = str(result.get("res_path") or "")
+        if result.get("godot_scene_summary") and not res_path.endswith(".gd"):
+            parts.append(str(result["godot_scene_summary"]))
+        parts.append(str(result.get("numbered_content") or ""))
+        text = "\n".join(parts)
+    else:
+        cleaned: Dict[str, Any] = {}
+        for k, v in result.items():
+            if k in ("path", "backup_path", "formatted_injection"):
+                continue
+            if k in ("closed_loop_vision_check", "contact_sheet") and isinstance(v, dict):
+                cleaned[k] = {
+                    ck: ("[preview image attached in the next message]" if ck == "image_url" else cv)
+                    for ck, cv in v.items()
+                }
+            elif k == "unified_diff" and isinstance(v, str) and len(v) > 1500:
+                cleaned[k] = v[:1500] + "\n... [diff truncated]"
+            else:
+                cleaned[k] = v
+        if tool_name == "recall_memory" and result.get("formatted_injection"):
+            text = str(result["formatted_injection"])
         else:
-            cleaned[k] = v
-    return json.dumps(cleaned)
+            text = json.dumps(cleaned, ensure_ascii=False, default=str)
+    if len(text) > _MAX_TOOL_RESULT_CHARS:
+        text = text[:_MAX_TOOL_RESULT_CHARS] + "\n... [output truncated - request a narrower range]"
+    return text
 
 
 async def run_agent_turn(
     user_prompt: str,
     attachments: List[Dict[str, Any]],
     simulate_context_tokens: Optional[int] = None,
-    max_steps: int = 12,
+    max_steps: int = 30,
+) -> Dict[str, Any]:
+    """Run one user turn (serialized: one turn at a time) and persist the conversation afterwards."""
+    async with TURN_LOCK:
+        orchestrator.agent_turn_active = True
+        try:
+            result = await _run_agent_turn_locked(
+                user_prompt, attachments, simulate_context_tokens, max_steps
+            )
+        except Exception as exc:
+            logger.exception(f"Agent turn crashed: {exc}")
+            result = {
+                "thinking": "",
+                "content": f"**The harness hit an internal error and stopped this turn:** `{type(exc).__name__}: {exc}`",
+                "tool_calls": [],
+                "vision_self_checks": [],
+                "vram_telemetry": get_full_status_snapshot(),
+                "tier2_compaction": None,
+                "diff_history": tool_executor.get_diff_history(),
+                "error": str(exc),
+            }
+        finally:
+            orchestrator.agent_turn_active = False
+        _persist_history()
+        return result
+
+
+async def _run_agent_turn_locked(
+    user_prompt: str,
+    attachments: List[Dict[str, Any]],
+    simulate_context_tokens: Optional[int],
+    max_steps: int,
 ) -> Dict[str, Any]:
     """
-    Execute a full multi-step autonomous ReAct agentic coding & 2D/3D/Audio asset-creation turn:
-      1. Build multimodal user message from prompt + normalized attachments.
-      2. Run an autonomous multi-step loop (`step_idx` 1..`max_steps`):
-         - Estimate tokens -> auto-switch to Tier 2 HYBRID_RAM_OVERFLOW (--fit on, 96k ctx) if > 26,000 tokens
-           and run Pre-Compaction Memory Flush at >= 25,000 tokens.
-         - Call `llama-server.exe` (or built-in Godot 4 multi-phase dispatcher).
-         - Strip `<think>...</think>` blocks into collapsible UI drawer BEFORE parsing tool calls.
-         - Batch consecutive `generate_2d_asset` or `generate_game_audio` calls with `defer_llm_restore=True`
-           so back-to-back textures or audio tracks only perform a single VRAM swap.
-         - Inject Closed-Loop Vision Self-Check images (2D preview, 3-Angle Blender Contact Sheet,
-           or Audio Waveform + Mel-Spectrogram PNG) into `CONVERSATION_HISTORY` before the next loop step.
-      3. If Tier 2 overflow was triggered, compact older turns afterward and return to Tier 1 Fast VRAM Mode.
+    Multi-step tool-calling loop against the real local model:
+      1. Build the multimodal user message (prompt + attachments + current project file listing).
+      2. Loop: ensure the model is loaded -> ask for the next step -> run requested tools ->
+         feed results (and generated-asset preview images) back -> repeat until the model
+         answers without tool calls.
+      3. If the turn ran in Tier 2 RAM overflow, compact older turns and return to Tier 1.
     """
-    max_steps = max(1, min(25, int(max_steps)))
+    global _last_project_context_sig
+    max_steps = max(1, min(60, int(max_steps)))
 
     # 1. Construct multimodal content parts
     content_parts: List[Dict[str, Any]] = []
     attachment_summaries: List[str] = []
-
+    seen_image_urls: set = set()
     for att in attachments:
         ctx_text = att.get("context_text") or att.get("summary_text")
         if ctx_text:
             attachment_summaries.append(ctx_text)
-        if att.get("image_url"):
-            content_parts.append(
-                {"type": "image_url", "image_url": {"url": att["image_url"]}}
-            )
-        for img_obj in att.get("images", []):
-            if img_obj.get("image_url"):
-                content_parts.append(
-                    {"type": "image_url", "image_url": {"url": img_obj["image_url"]}}
-                )
+        # The ingestor reports a single image both as `image_url` and inside `images`: send it once
+        urls = [att.get("image_url")] + [img_obj.get("image_url") for img_obj in att.get("images", [])]
+        for url in urls:
+            if url and url not in seen_image_urls:
+                seen_image_urls.add(url)
+                content_parts.append({"type": "image_url", "image_url": {"url": url}})
 
     combined_text = user_prompt
     if attachment_summaries:
-        combined_text = (
-            user_prompt
-            + "\n\n--- Attached Multimodal Context ---\n"
-            + "\n\n".join(attachment_summaries)
-        )
+        combined_text += "\n\n--- Attached Multimodal Context ---\n" + "\n\n".join(attachment_summaries)
 
+    project_context = _build_project_context()
+    if project_context != _last_project_context_sig:
+        combined_text += "\n\n" + project_context
+        _last_project_context_sig = project_context
+
+    user_msg: Dict[str, Any] = {"role": "user", "display_text": user_prompt}
     if content_parts:
-        content_parts.insert(0, {"type": "text", "text": combined_text})
-        user_msg: Dict[str, Any] = {"role": "user", "content": content_parts}
+        user_msg["content"] = [{"type": "text", "text": combined_text}] + content_parts
     else:
-        user_msg = {"role": "user", "content": combined_text}
-
+        user_msg["content"] = combined_text
     CONVERSATION_HISTORY.append(user_msg)
+    history_len_before_reply = len(CONVERSATION_HISTORY)
 
     all_thinking_traces: List[str] = []
     all_clean_replies: List[str] = []
     executed_tools: List[Dict[str, Any]] = []
     vision_self_checks: List[Dict[str, Any]] = []
     overflow_triggered = False
+    compacted_for_overflow = False
+    error_text: Optional[str] = None
+    hit_step_limit = False
 
-    # 2. Multi-step Autonomous ReAct Loop
+    # 2. Multi-step tool loop
     for step_idx in range(1, max_steps + 1):
-        logger.info(f"[AgentLoop] Starting ReAct Step {step_idx}/{max_steps}...")
-        await ws_manager.broadcast(
-            "step_start",
-            {"step": step_idx, "max_steps": max_steps},
-        )
+        logger.info(f"[AgentLoop] Step {step_idx}/{max_steps}")
+        await ws_manager.broadcast("step_start", {"step": step_idx, "max_steps": max_steps})
+
         messages_for_estimate = list(CONVERSATION_HISTORY)
         if step_idx == 1 and simulate_context_tokens and simulate_context_tokens > 26000:
-            pad_chars = "A" * int(simulate_context_tokens * 3.6)
-            messages_for_estimate = messages_for_estimate + [{"role": "user", "content": pad_chars}]
+            messages_for_estimate.append({"role": "user", "content": "A" * int(simulate_context_tokens * 3.6)})
 
+        if not _scripted_demo_enabled() and not orchestrator.is_llama_alive():
+            await ws_manager.broadcast(
+                "llm_status",
+                {"message": f"Loading {orchestrator.active_profile.display_name} into VRAM (can take a minute)..."},
+            )
         llm_ready_info = await orchestrator.ensure_llm_ready(
             messages=messages_for_estimate, tools=TOOL_DEFINITIONS
         )
         if llm_ready_info["overflow_active"]:
             overflow_triggered = True
-
         await ws_manager.broadcast("telemetry_update", get_full_status_snapshot())
+        await ws_manager.broadcast("llm_status", {"message": f"Step {step_idx}: model is thinking..."})
 
-        raw_response_text, api_tool_calls = await _call_llama_or_local_dispatcher(
-            CONVERSATION_HISTORY,
-            user_prompt,
-            step_index=step_idx,
-            executed_tools=executed_tools,
-        )
+        try:
+            raw_text, reasoning_text, api_tool_calls, finish_reason = await _call_llm(
+                CONVERSATION_HISTORY, user_prompt, step_idx, executed_tools
+            )
+        except LLMContextOverflowError as exc:
+            if compacted_for_overflow:
+                error_text = f"The conversation no longer fits the model's context window even after compaction: {exc}"
+                break
+            compacted_for_overflow = True
+            logger.warning("Context overflow reported by llama-server -> compacting history and retrying.")
+            compacted_hist, _ = await orchestrator.compact_and_return_to_tier1(
+                CONVERSATION_HISTORY, keep_recent_turns=6
+            )
+            CONVERSATION_HISTORY.clear()
+            CONVERSATION_HISTORY.extend(compacted_hist)
+            history_len_before_reply = -1
+            continue
+        except LLMUnavailableError as exc:
+            error_text = str(exc)
+            break
 
-        parsed = parse_thinking_and_tool_calls(raw_response_text, api_tool_calls)
-        step_thinking = parsed["thinking"]
+        parsed = parse_thinking_and_tool_calls(raw_text, api_tool_calls)
+        step_thinking = "\n\n".join(t for t in (reasoning_text.strip(), parsed["thinking"]) if t)
         step_reply = parsed["clean_content"]
         tool_calls = parsed["tool_calls"]
 
         if step_thinking:
-            all_thinking_traces.append(
-                f"[Step {step_idx}]\n{step_thinking}" if max_steps > 1 and len(all_thinking_traces) > 0 else step_thinking
-            )
+            all_thinking_traces.append(f"[Step {step_idx}]\n{step_thinking}")
         if step_reply:
             all_clean_replies.append(step_reply)
+        if finish_reason == "length" and not tool_calls:
+            all_clean_replies.append(
+                "_(The model's output was cut off at the token limit. Say \"continue\" to let it carry on.)_"
+            )
 
-        # If no tool calls were requested in this step, the agent has completed the turn
+        # Record the assistant step exactly as the model produced it, so the tool results
+        # that follow are correctly paired with their calls on the next request.
+        assistant_msg: Dict[str, Any] = {"role": "assistant", "content": step_reply}
+        if step_thinking:
+            assistant_msg["thinking"] = step_thinking
+        if tool_calls:
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": json.dumps(tc["arguments"])},
+                }
+                for tc in tool_calls
+            ]
+        CONVERSATION_HISTORY.append(assistant_msg)
+
+        # No tool calls -> the model has given its final answer for this turn
         if not tool_calls:
             break
 
@@ -515,13 +1021,11 @@ async def run_agent_turn(
             t_name = tc["name"]
             t_args = tc["arguments"]
 
-            # Batch VRAM Swap Optimization: if the next tool call in this step uses the exact same
-            # GPU swap engine (`generate_2d_asset` or `generate_game_audio`), defer restoring
-            # llama-server.exe until the last consecutive call of that engine!
+            # Batch VRAM swap: when the next call uses the same GPU engine, keep the LLM
+            # unloaded until the last consecutive call of that engine.
             next_tool_name = tool_calls[idx + 1]["name"] if (idx + 1) < len(tool_calls) else None
             defer_restore = (
-                t_name in ("generate_2d_asset", "generate_game_audio")
-                and next_tool_name == t_name
+                t_name in ("generate_2d_asset", "generate_game_audio") and next_tool_name == t_name
             )
 
             target_hint = (
@@ -532,7 +1036,7 @@ async def run_agent_turn(
                 or t_args.get("query")
                 or ""
             )
-            logger.info(f"[AgentLoop] Step {step_idx} -> Executing {t_name} ({target_hint})")
+            logger.info(f"[AgentLoop] Step {step_idx} -> {t_name} ({target_hint})")
             await ws_manager.broadcast(
                 "tool_start",
                 {
@@ -554,7 +1058,6 @@ async def run_agent_turn(
                 defer_llm_restore=defer_restore,
             )
             elapsed_s = round(time.time() - t_start, 2)
-            logger.info(f"[AgentLoop] Step {step_idx} -> Completed {t_name} ({target_hint}) in {elapsed_s}s")
 
             tool_record = {
                 "id": tc["id"],
@@ -566,36 +1069,26 @@ async def run_agent_turn(
                 "result": result,
             }
             executed_tools.append(tool_record)
-
             await ws_manager.broadcast("tool_complete", tool_record)
             await ws_manager.broadcast("telemetry_update", get_full_status_snapshot())
 
-            if t_name == "recall_memory" and result.get("formatted_injection"):
-                CONVERSATION_HISTORY.append(
-                    {
-                        "role": "tool",
-                        "name": "recall_memory",
-                        "content": result["formatted_injection"],
-                    }
-                )
-                all_clean_replies.append(result["formatted_injection"])
-            else:
-                CONVERSATION_HISTORY.append(
-                    {
-                        "role": "tool",
-                        "name": t_name,
-                        "content": _compact_tool_result_for_history(result),
-                    }
-                )
+            CONVERSATION_HISTORY.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": t_name,
+                    "content": _format_tool_result_for_model(t_name, result),
+                }
+            )
 
-            # Collect Closed-Loop Vision Self-Checks (2D preview, 3D Contact Sheet, Audio Spectrogram)
+            # Collect preview images of generated assets for the model to inspect next step
             if t_name == "generate_2d_asset" and result.get("closed_loop_vision_check", {}).get("image_url"):
                 vc = result["closed_loop_vision_check"]
                 v_item = {
-                    "source_tool": "generate_2d_asset",
+                    "source_tool": t_name,
                     "res_path": result.get("res_path"),
                     "image_url": vc["image_url"],
-                    "description": vc["description"],
+                    "description": vc.get("description"),
                     "pbr_maps": result.get("pbr_maps", {}),
                 }
                 vision_self_checks.append(v_item)
@@ -603,11 +1096,11 @@ async def run_agent_turn(
             elif t_name == "run_blender_script" and result.get("contact_sheet", {}).get("image_url"):
                 cs = result["contact_sheet"]
                 v_item = {
-                    "source_tool": "run_blender_script",
+                    "source_tool": t_name,
                     "res_path": result.get("res_glb_path"),
                     "blend_path": result.get("res_blend_path"),
                     "image_url": cs["image_url"],
-                    "description": cs["description"],
+                    "description": cs.get("description"),
                     "mesh_telemetry": result.get("mesh_telemetry", {}),
                 }
                 vision_self_checks.append(v_item)
@@ -615,11 +1108,11 @@ async def run_agent_turn(
             elif t_name == "generate_game_audio" and result.get("closed_loop_vision_check", {}).get("image_url"):
                 avc = result["closed_loop_vision_check"]
                 v_item = {
-                    "source_tool": "generate_game_audio",
+                    "source_tool": t_name,
                     "res_path": result.get("res_path"),
                     "mode": result.get("mode"),
                     "image_url": avc["image_url"],
-                    "description": avc["description"],
+                    "description": avc.get("description"),
                     "audio_metrics": result.get("audio_metrics", {}),
                     "godot_import_sidecar": result.get("godot_import_sidecar", {}),
                 }
@@ -635,43 +1128,49 @@ async def run_agent_turn(
                 {
                     "type": "text",
                     "text": (
-                        "[Closed-Loop Vision Self-Check Input] Inspect the generated 2D texture/sprite, "
-                        "3-Angle Blender Contact Sheet, or Audio Waveform + Mel-Spectrogram below and "
-                        "confirm proportions, normals, envelope loudness, and Godot 4 integration:"
+                        "[Automatic preview of the asset(s) you just generated: "
+                        + ", ".join(str(v.get("res_path")) for v in step_vision_checks)
+                        + "] Look at each image. If an asset is wrong (blank, wrong subject, broken shape, "
+                        "silent audio), regenerate it; otherwise continue with the task."
                     ),
                 }
             ]
             for vsc in step_vision_checks:
-                vision_parts.append(
-                    {"type": "image_url", "image_url": {"url": vsc["image_url"]}}
-                )
-            CONVERSATION_HISTORY.append({"role": "user", "content": vision_parts})
+                vision_parts.append({"type": "image_url", "image_url": {"url": vsc["image_url"]}})
+            CONVERSATION_HISTORY.append({"role": "user", "content": vision_parts, "synthetic": True})
 
         if paused_for_approval:
+            all_clean_replies.append(
+                "_(Paused: a shell command is waiting for your approval. Approve it, then tell me to continue.)_"
+            )
             break
+    else:
+        hit_step_limit = True
 
-    # 3. Synthesize Vision Self-Check summary and final assistant turn record
+    if hit_step_limit:
+        all_clean_replies.append(
+            f"_(Stopped after {max_steps} steps without finishing. Say \"continue\" to keep going.)_"
+        )
+
+    # 3. Assemble the reply shown in the chat
     thinking_trace = "\n\n".join(all_thinking_traces)
     clean_reply = "\n\n".join(r for r in all_clean_replies if r)
 
-    if vision_self_checks:
-        followup_summary = _build_vision_self_check_followup(executed_tools, vision_self_checks)
-        if followup_summary:
-            clean_reply = (
-                (clean_reply + "\n\n" + followup_summary).strip()
-                if clean_reply
-                else followup_summary
-            )
+    if error_text:
+        if len(CONVERSATION_HISTORY) == history_len_before_reply:
+            # Nothing was produced: drop the user message so a retry does not duplicate it
+            CONVERSATION_HISTORY.pop()
+            _last_project_context_sig = None
+        notice = f"**The local model could not respond.**\n\n{error_text}"
+        clean_reply = f"{clean_reply}\n\n{notice}".strip() if clean_reply else notice
+    elif not clean_reply:
+        clean_reply = (
+            "_(The model finished without writing a summary. The tool steps above show what it did.)_"
+            if executed_tools
+            else "_(The model returned an empty response. Try rephrasing or sending the message again.)_"
+        )
 
-    CONVERSATION_HISTORY.append(
-        {
-            "role": "assistant",
-            "content": clean_reply,
-            "thinking": thinking_trace,
-        }
-    )
-
-    # 4. If Tier 2 HYBRID_RAM_OVERFLOW was used, compact older turns afterward to return to Tier 1 Fast VRAM Mode
+    # 4. If Tier 2 RAM overflow was used, compact older turns and return to Tier 1 Fast VRAM Mode
     compaction_meta = None
     if overflow_triggered:
         compacted_hist, compaction_meta = await orchestrator.compact_and_return_to_tier1(
@@ -689,1111 +1188,8 @@ async def run_agent_turn(
         "vram_telemetry": get_full_status_snapshot(),
         "tier2_compaction": compaction_meta,
         "diff_history": tool_executor.get_diff_history(),
+        "error": error_text,
     }
-
-
-async def _call_llama_or_local_dispatcher(
-    messages: List[Dict[str, Any]],
-    user_prompt: str,
-    step_index: int = 1,
-    executed_tools: Optional[List[Dict[str, Any]]] = None,
-) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
-    """
-    Query live llama-server.exe at http://127.0.0.1:<port>/v1/chat/completions if running;
-    otherwise use the built-in deterministic Godot 4 Agentic Dispatcher so all tools,
-    multi-phase game builds, <think> drawers, 2D/3D/Audio generators, and diffs work out of the box.
-    """
-    if (
-        orchestrator._llama_process is not None
-        and orchestrator._llama_process.poll() is None
-    ):
-        url = f"http://127.0.0.1:{orchestrator.llama_port}/v1/chat/completions"
-        payload = {
-            "model": orchestrator.active_profile.model_filename,
-            "messages": [
-                {"role": m["role"], "content": m["content"]}
-                for m in messages
-                if m.get("role") in ("system", "user", "assistant", "tool")
-            ],
-            "tools": TOOL_DEFINITIONS,
-            "temperature": 0.2,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(url, json=payload)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    choice = data["choices"][0]["message"]
-                    return choice.get("content") or "", choice.get("tool_calls")
-        except Exception as exc:
-            logger.warning(f"llama-server request failed ({exc}); using built-in agentic dispatcher.")
-
-    return _synthesize_local_agent_response(
-        user_prompt=user_prompt,
-        step_index=step_index,
-        executed_tools=executed_tools or [],
-    )
-
-
-def _build_blender_script_for_asset(res_glb_path: str) -> str:
-    """Return a rich procedural Blender 4.x bpy script tailored to the requested .glb model."""
-    stem = Path(res_glb_path).stem.lower()
-    if "paddle" in stem:
-        return (
-            "import bpy\n"
-            "# Beveled sci-fi energy paddle body\n"
-            "bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0.25))\n"
-            "paddle = bpy.context.active_object\n"
-            "paddle.name = 'PaddleBody'\n"
-            "paddle.scale = (2.8, 0.55, 0.42)\n"
-            "bev = paddle.modifiers.new(name='Bevel', type='BEVEL')\n"
-            "bev.width = 0.08\n"
-            "bev.segments = 3\n"
-            "mat_body = bpy.data.materials.new(name='PaddleEnergyMat')\n"
-            "mat_body.use_nodes = True\n"
-            "bsdf = mat_body.node_tree.nodes.get('Principled BSDF')\n"
-            "if bsdf:\n"
-            "    bsdf.inputs['Base Color'].default_value = (0.12, 0.72, 0.98, 1.0)\n"
-            "    bsdf.inputs['Metallic'].default_value = 0.85\n"
-            "    bsdf.inputs['Roughness'].default_value = 0.22\n"
-            "paddle.data.materials.append(mat_body)\n"
-            "# Glowing side thrusters\n"
-            "for side, x_pos in (('L', -1.55), ('R', 1.55)):\n"
-            "    bpy.ops.mesh.primitive_cylinder_add(radius=0.24, depth=0.65, location=(x_pos, 0, 0.25))\n"
-            "    thr = bpy.context.active_object\n"
-            "    thr.name = f'PaddleThruster_{side}'\n"
-            "    thr.data.materials.append(mat_body)\n"
-            "# Clean -col collision mesh\n"
-            "bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0.25))\n"
-            "col = bpy.context.active_object\n"
-            "col.name = 'Paddle-col'\n"
-            "col.scale = (3.3, 0.65, 0.45)\n"
-        )
-    if "brick" in stem:
-        return (
-            "import bpy, os\n"
-            "# Chamfered cyber-crystal brick UV-mapped to res://assets/textures/brick_albedo.png\n"
-            "bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0.3))\n"
-            "brick = bpy.context.active_object\n"
-            "brick.name = 'CyberBrick'\n"
-            "brick.scale = (1.6, 0.75, 0.55)\n"
-            "bev = brick.modifiers.new(name='Bevel', type='BEVEL')\n"
-            "bev.width = 0.09\n"
-            "bev.segments = 2\n"
-            "mat = bpy.data.materials.new(name='CyberCrystalBrickMat')\n"
-            "mat.use_nodes = True\n"
-            "nodes = mat.node_tree.nodes\n"
-            "links = mat.node_tree.links\n"
-            "bsdf = nodes.get('Principled BSDF')\n"
-            "tex_node = nodes.new('ShaderNodeTexImage')\n"
-            "tex_path = 'res://assets/textures/brick_albedo.png'\n"
-            "if os.path.exists(tex_path):\n"
-            "    tex_node.image = bpy.data.images.load(tex_path)\n"
-            "    if bsdf:\n"
-            "        links.new(bsdf.inputs['Base Color'], tex_node.outputs['Color'])\n"
-            "brick.data.materials.append(mat)\n"
-            "bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0.3))\n"
-            "col = bpy.context.active_object\n"
-            "col.name = 'CyberBrick-col'\n"
-            "col.scale = (1.62, 0.77, 0.57)\n"
-        )
-    if "arena" in stem or "frame" in stem or "border" in stem or "wall" in stem:
-        return (
-            "import bpy\n"
-            "# Sleek U-shaped 3D containment border (Left, Right, and Top rails) with -col static collision\n"
-            "mat = bpy.data.materials.new(name='ArenaFrameMat')\n"
-            "mat.use_nodes = True\n"
-            "bsdf = mat.node_tree.nodes.get('Principled BSDF')\n"
-            "if bsdf:\n"
-            "    bsdf.inputs['Base Color'].default_value = (0.09, 0.16, 0.28, 1.0)\n"
-            "    bsdf.inputs['Metallic'].default_value = 0.9\n"
-            "    bsdf.inputs['Roughness'].default_value = 0.25\n"
-            "rails = [\n"
-            "    ('ArenaRailLeft',  (-10.5, 0.0, 0.6), (0.8, 22.0, 1.2)),\n"
-            "    ('ArenaRailRight', ( 10.5, 0.0, 0.6), (0.8, 22.0, 1.2)),\n"
-            "    ('ArenaRailTop',   (  0.0, -10.6, 0.6), (21.8, 0.8, 1.2)),\n"
-            "]\n"
-            "for r_name, loc, scl in rails:\n"
-            "    bpy.ops.mesh.primitive_cube_add(size=1.0, location=loc)\n"
-            "    vis = bpy.context.active_object\n"
-            "    vis.name = r_name\n"
-            "    vis.scale = scl\n"
-            "    bev = vis.modifiers.new(name='Bevel', type='BEVEL')\n"
-            "    bev.width = 0.07\n"
-            "    bev.segments = 2\n"
-            "    vis.data.materials.append(mat)\n"
-            "    bpy.ops.mesh.primitive_cube_add(size=1.0, location=loc)\n"
-            "    col = bpy.context.active_object\n"
-            "    col.name = f'{r_name}-col'\n"
-            "    col.scale = scl\n"
-        )
-    title = Path(res_glb_path).stem.title().replace("_", "")
-    return (
-        "import bpy\n"
-        f"bpy.ops.mesh.primitive_cube_add(size=1.2, location=(0, 0, 0.6))\n"
-        f"main_obj = bpy.context.active_object\n"
-        f"main_obj.name = '{title}'\n"
-        f"bev = main_obj.modifiers.new(name='Bevel', type='BEVEL')\n"
-        f"bev.width = 0.08\n"
-        f"bev.segments = 2\n"
-        f"bpy.ops.mesh.primitive_cube_add(size=1.22, location=(0, 0, 0.6))\n"
-        f"col_obj = bpy.context.active_object\n"
-        f"col_obj.name = '{title}-col'\n"
-    )
-
-
-def _build_godot_code_file_content(res_path: str, user_prompt: str) -> str:
-    """Generate complete, modular, playable Godot 4.3 scenes (.tscn), GDScript (.gd), or project.godot."""
-    lower = res_path.lower()
-    if lower.endswith("project.godot"):
-        return (
-            "; Engine configuration file.\n"
-            "; Configured by the Local Godot 4 Agentic Harness.\n\n"
-            "config_version=5\n\n"
-            "[application]\n\n"
-            'config/name="Nebula Breaker 3D"\n'
-            'run/main_scene="res://scenes/main.tscn"\n'
-            'config/features=PackedStringArray("4.3", "Forward Plus")\n'
-            'config/icon="res://assets/ui/powerup_icon.png"\n\n'
-            "[display]\n\n"
-            "window/size/viewport_width=1280\n"
-            "window/size/viewport_height=720\n\n"
-            "[input]\n\n"
-            "move_left={\n"
-            '"deadzone": 0.2,\n'
-            '"events": []\n'
-            "}\n"
-            "move_right={\n"
-            '"deadzone": 0.2,\n'
-            '"events": []\n'
-            "}\n"
-            "launch_ball={\n"
-            '"deadzone": 0.2,\n'
-            '"events": []\n'
-            "}\n"
-        )
-
-    if lower.endswith("paddle.gd"):
-        return (
-            "extends CharacterBody3D\n"
-            "class_name NebulaPaddle3D\n\n"
-            "signal ball_deflected(hit_offset: float)\n"
-            "signal powerup_collected(powerup_type: String)\n\n"
-            "@export var move_speed: float = 16.0\n"
-            "@export var arena_half_width: float = 8.4\n"
-            "@export var base_width: float = 3.0\n"
-            "@export var use_mouse_control: bool = false\n\n"
-            "var width_multiplier: float = 1.0\n"
-            "var wide_timer: float = 0.0\n\n"
-            "func _ready() -> void:\n"
-            "\tadd_to_group(\"paddle\")\n\n"
-            "func _physics_process(delta: float) -> void:\n"
-            "\tif wide_timer > 0.0:\n"
-            "\t\twide_timer -= delta\n"
-            "\t\tif wide_timer <= 0.0:\n"
-            "\t\t\tset_wide_paddle(false)\n\n"
-            "\tvar dir: float = 0.0\n"
-            "\tif Input.is_Key_pressed(KEY_A) or Input.is_Key_pressed(KEY_LEFT) or Input.is_action_pressed(\"ui_left\"):\n"
-            "\t\tdir -= 1.0\n"
-            "\tif Input.is_Key_pressed(KEY_D) or Input.is_Key_pressed(KEY_RIGHT) or Input.is_action_pressed(\"ui_right\"):\n"
-            "\t\tdir += 1.0\n\n"
-            "\tvelocity.x = dir * move_speed\n"
-            "\tvelocity.y = 0.0\n"
-            "\tvelocity.z = 0.0\n"
-            "\tmove_and_slide()\n"
-            "\tvar limit: float = maxf(2.0, arena_half_width - (base_width * width_multiplier * 0.5))\n"
-            "\tglobal_position.x = clampf(global_position.x, -limit, limit)\n"
-            "\tglobal_position.y = 0.3\n"
-            "\tglobal_position.z = 8.5\n\n"
-            "func get_deflection_direction(hit_world_x: float) -> Vector3:\n"
-            "\tvar half_w: float = maxf(0.5, (base_width * width_multiplier) * 0.5)\n"
-            "\tvar rel: float = clampf((hit_world_x - global_position.x) / half_w, -1.0, 1.0)\n"
-            "\tvar max_angle: float = deg_to_rad(62.0)\n"
-            "\tvar angle: float = rel * max_angle\n"
-            "\tvar dir := Vector3(sin(angle), 0.0, -cos(angle)).normalized()\n"
-            "\tball_deflected.emit(rel)\n"
-            "\treturn dir\n\n"
-            "func set_wide_paddle(enabled: bool, duration: float = 10.0) -> void:\n"
-            "\twidth_multiplier = 1.55 if enabled else 1.0\n"
-            "\twide_timer = duration if enabled else 0.0\n"
-            "\tscale.x = width_multiplier\n"
-        ).replace("is_Key_pressed", "is_key_pressed")
-
-    if lower.endswith("ball.gd"):
-        return (
-            "extends CharacterBody3D\n"
-            "class_name NebulaBall3D\n\n"
-            "signal brick_hit(brick_node: Node, impact_pos: Vector3)\n"
-            "signal paddle_bounced(impact_pos: Vector3)\n"
-            "signal ball_lost(ball_node: Node)\n\n"
-            "@export var base_speed: float = 13.5\n"
-            "@export var max_speed: float = 25.0\n"
-            "@export var speed_ramp_per_combo: float = 0.45\n"
-            "@export var arena_bounds_x: float = 9.6\n"
-            "@export var arena_top_z: float = -9.8\n"
-            "@export var arena_bottom_z: float = 11.2\n\n"
-            "var current_speed: float = 13.5\n"
-            "var move_dir: Vector3 = Vector3(0.25, 0.0, -1.0).normalized()\n"
-            "var is_launched: bool = false\n"
-            "var plasma_piercer_active: bool = false\n"
-            "var plasma_timer: float = 0.0\n"
-            "var combo_count: int = 0\n\n"
-            "func _ready() -> void:\n"
-            "\tadd_to_group(\"balls\")\n"
-            "\tcurrent_speed = base_speed\n\n"
-            "func launch(initial_dir: Vector3 = Vector3(0.2, 0.0, -1.0)) -> void:\n"
-            "\tmove_dir = Vector3(initial_dir.x, 0.0, initial_dir.z).normalized()\n"
-            "\tis_launched = true\n\n"
-            "func activate_plasma_piercer(duration: float = 6.0) -> void:\n"
-            "\tplasma_piercer_active = true\n"
-            "\tplasma_timer = duration\n\n"
-            "func _physics_process(delta: float) -> void:\n"
-            "\tif not is_launched:\n"
-            "\t\treturn\n\n"
-            "\tif plasma_piercer_active:\n"
-            "\t\tplasma_timer -= delta\n"
-            "\t\tif plasma_timer <= 0.0:\n"
-            "\t\t\tplasma_piercer_active = false\n\n"
-            "\tvar step_vec: Vector3 = move_dir * current_speed * delta\n"
-            "\tvar collision: KinematicCollision3D = move_and_collide(step_vec)\n"
-            "\tif collision:\n"
-            "\t\tvar collider: Object = collision.get_collider()\n"
-            "\t\tvar hit_pos: Vector3 = collision.get_position()\n"
-            "\t\tvar normal: Vector3 = collision.get_normal()\n"
-            "\t\tnormal.y = 0.0\n"
-            "\t\tif normal.length_squared() < 0.001:\n"
-            "\t\t\tnormal = Vector3(0.0, 0.0, 1.0)\n"
-            "\t\telse:\n"
-            "\t\t\tnormal = normal.normalized()\n\n"
-            "\t\tif collider and collider.has_method(\"get_deflection_direction\"):\n"
-            "\t\t\tmove_dir = collider.get_deflection_direction(hit_pos.x)\n"
-            "\t\t\tcombo_count = 0\n"
-            "\t\t\tpaddle_bounced.emit(hit_pos)\n"
-            "\t\telif collider and collider.has_method(\"apply_ball_damage\"):\n"
-            "\t\t\tcombo_count += 1\n"
-            "\t\t\tcurrent_speed = minf(max_speed, base_speed + float(combo_count) * speed_ramp_per_combo)\n"
-            "\t\t\tcollider.apply_ball_damage(2 if plasma_piercer_active else 1, hit_pos)\n"
-            "\t\t\tbrick_hit.emit(collider, hit_pos)\n"
-            "\t\t\tif not plasma_piercer_active:\n"
-            "\t\t\t\tmove_dir = move_dir.bounce(normal).normalized()\n"
-            "\t\telse:\n"
-            "\t\t\tmove_dir = move_dir.bounce(normal).normalized()\n\n"
-            "\t# Clamp to 3D containment rails\n"
-            "\tif global_position.x <= -arena_bounds_x and move_dir.x < 0.0:\n"
-            "\t\tmove_dir.x = -move_dir.x\n"
-            "\telif global_position.x >= arena_bounds_x and move_dir.x > 0.0:\n"
-            "\t\tmove_dir.x = -move_dir.x\n"
-            "\tif global_position.z <= arena_top_z and move_dir.z < 0.0:\n"
-            "\t\tmove_dir.z = -move_dir.z\n"
-            "\tif absf(move_dir.z) < 0.18:\n"
-            "\t\tmove_dir.z = -0.25 if move_dir.z <= 0.0 else 0.25\n"
-            "\t\tmove_dir = move_dir.normalized()\n"
-            "\tglobal_position.y = 0.35\n\n"
-            "\tif global_position.z > arena_bottom_z:\n"
-            "\t\tis_launched = false\n"
-            "\t\tball_lost.emit(self)\n"
-        )
-
-    if lower.endswith("brick.gd"):
-        return (
-            "extends StaticBody3D\n"
-            "class_name NebulaBrick3D\n\n"
-            "signal brick_destroyed(brick: Node3D, tier: int, score_value: int, world_pos: Vector3)\n"
-            "signal brick_cracked(brick: Node3D, world_pos: Vector3)\n\n"
-            "enum BrickTier {\n"
-            "\tSTANDARD_NEON = 1,\n"
-            "\tARMORED_REACTOR = 2,\n"
-            "\tEXPLOSIVE_CORE = 3,\n"
-            "}\n\n"
-            "@export var brick_tier: int = BrickTier.STANDARD_NEON\n"
-            "@export var hit_points: int = 1\n"
-            "@export var score_value: int = 100\n"
-            "@export var explosion_radius: float = 3.2\n"
-            "@export var powerup_drop_chance: float = 0.28\n\n"
-            "var _is_destroyed: bool = false\n\n"
-            "func _ready() -> void:\n"
-            "\tadd_to_group(\"bricks\")\n"
-            "\tif brick_tier == BrickTier.ARMORED_REACTOR:\n"
-            "\t\thit_points = max(2, hit_points)\n"
-            "\t\tscore_value = 250\n"
-            "\telif brick_tier == BrickTier.EXPLOSIVE_CORE:\n"
-            "\t\thit_points = 1\n"
-            "\t\tscore_value = 350\n\n"
-            "func apply_ball_damage(amount: int, impact_pos: Vector3 = Vector3.ZERO) -> void:\n"
-            "\tif _is_destroyed:\n"
-            "\t\treturn\n"
-            "\thit_points -= amount\n"
-            "\tif hit_points > 0:\n"
-            "\t\t_shift_cracked_appearance()\n"
-            "\t\tbrick_cracked.emit(self, global_position)\n"
-            "\telse:\n"
-            "\t\t_destroy_brick()\n\n"
-            "func _shift_cracked_appearance() -> void:\n"
-            "\tscale = scale * 0.94\n\n"
-            "func _destroy_brick() -> void:\n"
-            "\tif _is_destroyed:\n"
-            "\t\treturn\n"
-            "\t_is_destroyed = true\n"
-            "\tvar pos: Vector3 = global_position\n"
-            "\tif brick_tier == BrickTier.EXPLOSIVE_CORE:\n"
-            "\t\t_detonate_adjacent_bricks(pos)\n"
-            "\tbrick_destroyed.emit(self, brick_tier, score_value, pos)\n"
-            "\tqueue_free()\n\n"
-            "func _detonate_adjacent_bricks(origin: Vector3) -> void:\n"
-            "\tfor node in get_tree().get_nodes_in_group(\"bricks\"):\n"
-            "\t\tif node != self and node is Node3D and is_instance_valid(node):\n"
-            "\t\t\tvar other := node as Node3D\n"
-            "\t\t\tif other.global_position.distance_to(origin) <= explosion_radius:\n"
-            "\t\t\t\tif other.has_method(\"apply_ball_damage\"):\n"
-            "\t\t\t\t\tother.apply_ball_damage(5, origin)\n"
-        )
-
-    if lower.endswith("powerup.gd"):
-        return (
-            "extends Area3D\n"
-            "class_name NebulaPowerUp3D\n\n"
-            "signal activated(powerup_type: String)\n\n"
-            "# Types: 'multi_ball', 'wide_paddle', 'plasma_piercer'\n"
-            "@export var powerup_type: String = \"multi_ball\"\n"
-            "@export var fall_speed: float = 5.5\n"
-            "@export var spin_speed: float = 2.8\n\n"
-            "func _ready() -> void:\n"
-            "\tadd_to_group(\"powerups\")\n"
-            "\tbody_entered.connect(_on_body_entered)\n\n"
-            "func _physics_process(delta: float) -> void:\n"
-            "\tglobal_position.z += fall_speed * delta\n"
-            "\trotate_y(spin_speed * delta)\n"
-            "\tif global_position.z > 11.5:\n"
-            "\t\tqueue_free()\n\n"
-            "func _on_body_entered(body: Node3D) -> void:\n"
-            "\tif body and body.is_in_group(\"paddle\"):\n"
-            "\t\tactivated.emit(powerup_type)\n"
-            "\t\tqueue_free()\n"
-        )
-
-    if lower.endswith("hud.tscn"):
-        return (
-            '[gd_scene load_steps=2 format=3 uid="uid://nebula_hud_scene"]\n\n'
-            '[ext_resource type="Texture2D" path="res://assets/ui/powerup_icon.png" id="1_icon"]\n\n'
-            '[node name="HUD" type="CanvasLayer"]\n\n'
-            '[node name="TopBar" type="HBoxContainer" parent="."]\n'
-            "offset_left = 24.0\n"
-            "offset_top = 16.0\n"
-            "offset_right = 1256.0\n"
-            "offset_bottom = 64.0\n\n"
-            '[node name="PowerUpIcon" type="TextureRect" parent="TopBar"]\n'
-            "custom_minimum_size = Vector2(36, 36)\n"
-            'texture = ExtResource("1_icon")\n'
-            "expand_mode = 1\n\n"
-            '[node name="ScoreLabel" type="Label" parent="TopBar"]\n'
-            'text = "SCORE: 0000"\n\n'
-            '[node name="LivesLabel" type="Label" parent="TopBar"]\n'
-            'text = "   LIVES: 3"\n\n'
-            '[node name="LevelLabel" type="Label" parent="TopBar"]\n'
-            'text = "   LEVEL: 1"\n\n'
-            '[node name="ComboLabel" type="Label" parent="TopBar"]\n'
-            'text = "   COMBO: 1x"\n\n'
-            '[node name="OverlayMessage" type="Label" parent="."]\n'
-            "offset_left = 340.0\n"
-            "offset_top = 320.0\n"
-            "offset_right = 940.0\n"
-            "offset_bottom = 400.0\n"
-            'text = "NEBULA BREAKER 3D — PRESS SPACE / CLICK TO LAUNCH"\n'
-        )
-
-    if lower.endswith("main.tscn"):
-        return (
-            '[gd_scene load_steps=16 format=3 uid="uid://nebula_main_3d"]\n\n'
-            '[ext_resource type="Material" path="res://assets/textures/arena_floor_material.tres" id="1_floor_mat"]\n'
-            '[ext_resource type="PackedScene" path="res://assets/models/paddle.glb" id="2_paddle_glb"]\n'
-            '[ext_resource type="PackedScene" path="res://assets/models/brick.glb" id="3_brick_glb"]\n'
-            '[ext_resource type="PackedScene" path="res://assets/models/arena_frame.glb" id="4_frame_glb"]\n'
-            '[ext_resource type="AudioStream" path="res://assets/audio/sfx_paddle_hit.wav" id="5_sfx_paddle"]\n'
-            '[ext_resource type="AudioStream" path="res://assets/audio/sfx_brick_break.wav" id="6_sfx_brick"]\n'
-            '[ext_resource type="AudioStream" path="res://assets/audio/bgm_synthwave.ogg" id="7_bgm"]\n'
-            '[ext_resource type="Script" path="res://scripts/paddle.gd" id="8_paddle_gd"]\n'
-            '[ext_resource type="Script" path="res://scripts/ball.gd" id="9_ball_gd"]\n'
-            '[ext_resource type="Script" path="res://scripts/brick.gd" id="10_brick_gd"]\n'
-            '[ext_resource type="PackedScene" path="res://scenes/hud.tscn" id="11_hud"]\n\n'
-            '[sub_resource type="Environment" id="Environment_nebula"]\n'
-            "background_mode = 1\n"
-            "background_color = Color(0.03, 0.04, 0.09, 1)\n"
-            "ambient_light_source = 2\n"
-            "ambient_light_color = Color(0.22, 0.34, 0.55, 1)\n"
-            "ambient_light_energy = 0.85\n"
-            "tonemap_mode = 2\n"
-            "glow_enabled = true\n"
-            "glow_intensity = 0.9\n"
-            "glow_bloom = 0.25\n\n"
-            '[sub_resource type="PlaneMesh" id="PlaneMesh_floor"]\n'
-            "size = Vector2(22, 22)\n\n"
-            '[sub_resource type="BoxShape3D" id="BoxShape3D_paddle"]\n'
-            "size = Vector3(3.0, 0.6, 0.6)\n\n"
-            '[sub_resource type="SphereShape3D" id="SphereShape3D_ball"]\n'
-            "radius = 0.32\n\n"
-            '[sub_resource type="SphereMesh" id="SphereMesh_ball"]\n'
-            "radius = 0.32\n"
-            "height = 0.64\n\n"
-            '[node name="NebulaBreakerMain" type="Node3D"]\n\n'
-            '[node name="WorldEnvironment" type="WorldEnvironment" parent="."]\n'
-            'environment = SubResource("Environment_nebula")\n\n'
-            '[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]\n'
-            "transform = Transform3D(0.866025, -0.383022, 0.321394, 0, 0.642788, 0.766044, -0.5, -0.663414, 0.55667, 0, 14, 8)\n"
-            "light_energy = 1.6\n"
-            "shadow_enabled = true\n\n"
-            '[node name="Camera3D" type="Camera3D" parent="."]\n'
-            "transform = Transform3D(1, 0, 0, 0, 0.422618, 0.906308, 0, -0.906308, 0.422618, 0, 16.5, 9.2)\n"
-            "current = true\n"
-            "fov = 60.0\n\n"
-            '[node name="ArenaFloor" type="MeshInstance3D" parent="."]\n'
-            'mesh = SubResource("PlaneMesh_floor")\n'
-            'surface_material_override/0 = ExtResource("1_floor_mat")\n\n'
-            '[node name="ArenaBorderFrame" type="StaticBody3D" parent="."]\n\n'
-            '[node name="ArenaFrameModel" parent="ArenaBorderFrame" instance=ExtResource("4_frame_glb")]\n\n'
-            '[node name="Paddle" type="CharacterBody3D" parent="." groups=["paddle"]]\n'
-            "transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.3, 8.5)\n"
-            'script = ExtResource("8_paddle_gd")\n\n'
-            '[node name="PaddleCollider" type="CollisionShape3D" parent="Paddle"]\n'
-            'shape = SubResource("BoxShape3D_paddle")\n\n'
-            '[node name="PaddleMesh" parent="Paddle" instance=ExtResource("2_paddle_glb")]\n\n'
-            '[node name="Ball" type="CharacterBody3D" parent="." groups=["balls"]]\n'
-            "transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.35, 7.4)\n"
-            'script = ExtResource("9_ball_gd")\n\n'
-            '[node name="BallCollider" type="CollisionShape3D" parent="Ball"]\n'
-            'shape = SubResource("SphereShape3D_ball")\n\n'
-            '[node name="BallMesh" type="MeshInstance3D" parent="Ball"]\n'
-            'mesh = SubResource("SphereMesh_ball")\n\n'
-            '[node name="BrickGrid" type="Node3D" parent="."]\n\n'
-            '[node name="BrickStandard_1" type="StaticBody3D" parent="BrickGrid" groups=["bricks"]]\n'
-            "transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.0, 0.35, -4.5)\n"
-            'script = ExtResource("10_brick_gd")\n'
-            "brick_tier = 1\n\n"
-            '[node name="BrickModel1" parent="BrickGrid/BrickStandard_1" instance=ExtResource("3_brick_glb")]\n\n'
-            '[node name="BrickArmored_2" type="StaticBody3D" parent="BrickGrid" groups=["bricks"]]\n'
-            "transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.0, 0.35, -4.5)\n"
-            'script = ExtResource("10_brick_gd")\n'
-            "brick_tier = 2\n"
-            "hit_points = 2\n\n"
-            '[node name="BrickModel2" parent="BrickGrid/BrickArmored_2" instance=ExtResource("3_brick_glb")]\n\n'
-            '[node name="BrickExplosive_3" type="StaticBody3D" parent="BrickGrid" groups=["bricks"]]\n'
-            "transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.0, 0.35, -4.5)\n"
-            'script = ExtResource("10_brick_gd")\n'
-            "brick_tier = 3\n\n"
-            '[node name="BrickModel3" parent="BrickGrid/BrickExplosive_3" instance=ExtResource("3_brick_glb")]\n\n'
-            '[node name="AudioPlayers" type="Node" parent="."]\n\n'
-            '[node name="SfxPaddleHit" type="AudioStreamPlayer3D" parent="AudioPlayers"]\n'
-            'stream = ExtResource("5_sfx_paddle")\n\n'
-            '[node name="SfxBrickBreak" type="AudioStreamPlayer3D" parent="AudioPlayers"]\n'
-            'stream = ExtResource("6_sfx_brick")\n\n'
-            '[node name="BgmSynthwave" type="AudioStreamPlayer" parent="AudioPlayers"]\n'
-            'stream = ExtResource("7_bgm")\n'
-            "autoplay = true\n\n"
-            '[node name="HUD" parent="." instance=ExtResource("11_hud")]\n'
-        )
-
-    if lower.endswith(".gd"):
-        cls_name = Path(res_path).stem.title().replace("_", "")
-        return (
-            "extends Node3D\n"
-            f"class_name {cls_name}\n\n"
-            "func _ready() -> void:\n"
-            "\tpass\n"
-        )
-
-    return (
-        '[gd_scene format=3 uid="uid://generated_scene"]\n\n'
-        '[node name="RootNode3D" type="Node3D"]\n'
-    )
-
-
-def _extract_code_paths_from_prompt(user_prompt: str, res_paths: List[str]) -> List[str]:
-    """Extract both explicit res:// code files and bare .tscn / .gd / project.godot filenames from the prompt."""
-    found: List[str] = [
-        p for p in res_paths if p.lower().endswith((".tscn", ".gd", ".godot"))
-    ]
-    if "project.godot" in user_prompt.lower() and "res://project.godot" not in found:
-        found.insert(0, "res://project.godot")
-
-    bare_matches = re.findall(r"\b([A-Za-z0-9_]+\.(?:tscn|gd))\b", user_prompt)
-    for bm in bare_matches:
-        bm_low = bm.lower()
-        if any(p.lower().endswith("/" + bm_low) or p.lower() == "res://" + bm_low for p in found):
-            continue
-        if bm_low.endswith(".tscn"):
-            found.append(f"res://scenes/{bm}")
-        elif bm_low.endswith(".gd"):
-            found.append(f"res://scripts/{bm}")
-
-    # Order: project.godot first, then .gd scripts, then hud.tscn, then main.tscn (so ExtResource targets exist first!)
-    def _sort_key(p: str) -> int:
-        pl = p.lower()
-        if pl.endswith("project.godot"):
-            return 0
-        if pl.endswith(".gd"):
-            return 1
-        if "hud" in pl and pl.endswith(".tscn"):
-            return 2
-        return 3
-
-    return sorted(list(dict.fromkeys(found)), key=_sort_key)
-
-
-def _synthesize_multi_phase_step(
-    user_prompt: str,
-    step_index: int,
-    executed_tools: List[Dict[str, Any]],
-) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
-    """
-    When a user prompt specifies a multi-phase build (mentioning multiple `res://` assets
-    across 2D textures `.png`, 3D models `.glb`, audio `.wav`/`.ogg`, scenes/scripts `.tscn`/`.gd`,
-    and headless validation), orchestrate the phases step-by-step across the ReAct loop so
-    Closed-Loop Vision Self-Checks occur between each phase.
-    """
-    res_paths = re.findall(r"res://[A-Za-z0-9_/\.\-]+\.[a-z0-9]+", user_prompt)
-    png_paths = list(dict.fromkeys(p for p in res_paths if p.lower().endswith(".png")))
-    glb_paths = list(dict.fromkeys(p for p in res_paths if p.lower().endswith(".glb")))
-    audio_paths = list(dict.fromkeys(p for p in res_paths if p.lower().endswith((".wav", ".ogg"))))
-    code_paths = _extract_code_paths_from_prompt(user_prompt, res_paths)
-
-    phases_present = sum(bool(x) for x in (png_paths, glb_paths, audio_paths, code_paths))
-    if phases_present < 2:
-        return None
-
-    done_2d = {
-        t["arguments"].get("output_path")
-        for t in executed_tools
-        if t["name"] == "generate_2d_asset"
-    }
-    done_3d = {
-        t["arguments"].get("output_glb_path")
-        for t in executed_tools
-        if t["name"] == "run_blender_script"
-    }
-    done_audio = {
-        t["arguments"].get("output_path")
-        for t in executed_tools
-        if t["name"] == "generate_game_audio"
-    }
-    done_code = {
-        t["arguments"].get("path")
-        for t in executed_tools
-        if t["name"] == "write_file"
-    }
-    done_validation = any(t["name"] == "run_command" for t in executed_tools)
-
-    # Phase 1: 2D Textures & UI Icons
-    pending_2d = [p for p in png_paths if p not in done_2d]
-    if pending_2d:
-        t_calls = []
-        for p in pending_2d:
-            is_icon = "icon" in p.lower() or "ui" in p.lower() or "orb" in p.lower()
-            is_pbr = "floor" in p.lower() or "wall" in p.lower() or "brick" in p.lower() or "pbr" in user_prompt.lower()
-            a_type = "ui_icon" if is_icon else "seamless_texture"
-            t_calls.append(
-                {
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                    "function": {
-                        "name": "generate_2d_asset",
-                        "arguments": json.dumps(
-                            {
-                                "prompt": f"Game asset for {p}: {user_prompt[:220]}",
-                                "asset_type": a_type,
-                                "output_path": p,
-                                "transparent_bg": is_icon,
-                                "generate_pbr_maps": is_pbr and not is_icon,
-                                "width": 1024,
-                                "height": 1024,
-                                "steps": 4,
-                            }
-                        ),
-                    },
-                }
-            )
-        thinking = (
-            f"<think>\n"
-            f"Multi-Phase Game Build — Phase 1 (2D Assets): Generating {len(pending_2d)} texture/UI assets "
-            f"({', '.join(pending_2d)}) in a single batched Tier 3 VRAM swap (`defer_llm_restore=True` between consecutive calls).\n"
-            f"</think>"
-        )
-        return f"{thinking}\n**Phase 1:** Generating 2D textures & UI icons (`{', '.join(pending_2d)}`).", t_calls
-
-    # Phase 2: 3D Headless Blender Models (.glb + 3-Angle Contact Sheets)
-    pending_3d = [p for p in glb_paths if p not in done_3d]
-    if pending_3d:
-        t_calls = []
-        for p in pending_3d:
-            bpy_script = _build_blender_script_for_asset(p)
-            t_calls.append(
-                {
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                    "function": {
-                        "name": "run_blender_script",
-                        "arguments": json.dumps(
-                            {
-                                "script_code": bpy_script,
-                                "output_glb_path": p,
-                                "render_preview": True,
-                                "heavy_cycles_bake": False,
-                            }
-                        ),
-                    },
-                }
-            )
-        thinking = (
-            f"<think>\n"
-            f"Inspected Phase 1 2D previews. Proceeding to Phase 2 (Headless Blender 3D Pipeline): "
-            f"Modeling and exporting {', '.join(pending_3d)} with `-col` collision suffixes and 3-Angle Visual Verification Contact Sheets.\n"
-            f"</think>"
-        )
-        return f"{thinking}\n**Phase 2:** Modeling 3D `.glb` assets in headless Blender (`{', '.join(pending_3d)}`).", t_calls
-
-    # Phase 3: 2-in-1 Game Audio (SFX .wav & Instrumental Music Loop .ogg)
-    pending_audio = [p for p in audio_paths if p not in done_audio]
-    if pending_audio:
-        t_calls = []
-        for p in pending_audio:
-            is_music = p.lower().endswith(".ogg") or "bgm" in p.lower() or "music" in p.lower()
-            mode = "music_loop" if is_music else "sfx"
-            dur = 24.0 if is_music else (1.5 if "break" in p.lower() else 1.0)
-            t_calls.append(
-                {
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                    "function": {
-                        "name": "generate_game_audio",
-                        "arguments": json.dumps(
-                            {
-                                "prompt": f"Game audio for {p}: {'energetic instrumental retro-futuristic arcade synthwave, no vocals' if is_music else 'punchy sci-fi arcade impact sfx'}",
-                                "mode": mode,
-                                "output_path": p,
-                                "duration_sec": dur,
-                                "seamless_loop": is_music,
-                                "steps": 50,
-                            }
-                        ),
-                    },
-                }
-            )
-        thinking = (
-            f"<think>\n"
-            f"Inspected Phase 2 3-Angle Blender Contact Sheets. Proceeding to Phase 3 (Atomic Audio-Gen Swap): "
-            f"Synthesizing {', '.join(pending_audio)} via `stabilityai/stable-audio-open-1.0` (FP16) and rendering Waveform + Mel-Spectrogram PNGs.\n"
-            f"</think>"
-        )
-        return f"{thinking}\n**Phase 3:** Synthesizing SFX & instrumental music loops (`{', '.join(pending_audio)}`).", t_calls
-
-    # Phase 4: Assemble Godot 4 project.godot, GDScript (.gd), and Scenes (.tscn)
-    pending_code = [p for p in code_paths if p not in done_code]
-    if pending_code:
-        t_calls = []
-        for p in pending_code:
-            file_content = _build_godot_code_file_content(p, user_prompt)
-            t_calls.append(
-                {
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                    "function": {
-                        "name": "write_file",
-                        "arguments": json.dumps(
-                            {
-                                "path": p,
-                                "content": file_content,
-                            }
-                        ),
-                    },
-                }
-            )
-        thinking = (
-            f"<think>\n"
-            f"Inspected Phase 3 Waveform + Mel-Spectrogram PNGs. Proceeding to Phase 4 (Scene & GDScript Assembly): "
-            f"Writing {', '.join(pending_code)} with modular Godot 4 nodes, physics, 3-tier bricks, power-ups, and HUD.\n"
-            f"</think>"
-        )
-        return f"{thinking}\n**Phase 4:** Writing Godot 4 configuration, scripts, and scenes (`{', '.join(pending_code)}`).", t_calls
-
-    # Phase 5: Headless Godot Validation
-    if not done_validation:
-        thinking = (
-            "<think>\n"
-            "All 2D textures, 3D `.glb` models, 44.1kHz stereo audio tracks, and Godot 4 scenes/scripts are assembled. "
-            "Now running `godot --headless --quit` project-wide validation via `run_command` to verify zero script or resource errors.\n"
-            "</think>"
-        )
-        t_calls = [
-            {
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "function": {
-                    "name": "run_command",
-                    "arguments": json.dumps({"command": "godot --headless --quit"}),
-                },
-            }
-        ]
-        return f"{thinking}\n**Phase 5:** Running `godot --headless --quit` project-wide validation.", t_calls
-
-    # All phases complete
-    thinking = (
-        "<think>\n"
-        "All phases (2D textures/icons, 3D Blender `.glb` models, 2-in-1 SFX/Music audio tracks, Godot 4 scenes/scripts, and headless Godot validation) "
-        "completed with 0 errors.\n"
-        "</think>"
-    )
-    return f"{thinking}\nAll multi-phase game assets, scenes (`main.tscn`, `hud.tscn`), scripts (`paddle.gd`, `ball.gd`, `brick.gd`, `powerup.gd`), and headless Godot 4 validations completed with **0 errors**.", []
-
-
-def _synthesize_local_agent_response(
-    user_prompt: str,
-    step_index: int = 1,
-    executed_tools: Optional[List[Dict[str, Any]]] = None,
-) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
-    """
-    Intelligent local response & tool-call synthesizer when GGUF weights are not yet downloaded.
-    Emits realistic <think>...</think> reasoning blocks and triggers the appropriate tools
-    based on the user's request (supporting both single-tool turns and multi-phase game builds).
-    """
-    executed_tools = executed_tools or []
-
-    # Check if this is a multi-phase game build prompt
-    multi_phase = _synthesize_multi_phase_step(user_prompt, step_index, executed_tools)
-    if multi_phase is not None:
-        return multi_phase
-
-    # For single-tool requests, finish the ReAct loop after step 1 has executed its tool call
-    if step_index >= 2:
-        return "", []
-
-    p_lower = user_prompt.lower()
-    tool_calls: List[Dict[str, Any]] = []
-
-    # 1. Check if user asked for 2D sprite / texture / icon / skybox generation
-    if any(k in p_lower for k in ("texture", "sprite", "icon", "skybox", "2d asset", "generate_2d_asset", "pbr")):
-        asset_type = "sprite"
-        if "seamless" in p_lower or "texture" in p_lower or "wall" in p_lower or "floor" in p_lower:
-            asset_type = "seamless_texture"
-        elif "icon" in p_lower or "ui" in p_lower:
-            asset_type = "ui_icon"
-        elif "skybox" in p_lower or "sky" in p_lower:
-            asset_type = "skybox_concept"
-
-        transparent = asset_type in ("sprite", "ui_icon") or "transparent" in p_lower
-        pbr = asset_type == "seamless_texture" or "pbr" in p_lower or "normal" in p_lower
-        slug = "generated_" + asset_type
-        out_path = f"res://assets/textures/{slug}.png"
-
-        thinking = (
-            f"<think>\n"
-            f"The user wants to create a 2D `{asset_type}` asset for Godot 4: \"{user_prompt}\".\n"
-            f"1. I will invoke `generate_2d_asset` which triggers the Tier 3 Atomic Image-Gen VRAM Swap:\n"
-            f"   - Step A: Save KV cache slot 0 (`POST /slots/0?action=save` -> `active_session.bin`).\n"
-            f"   - Step B: Unload `llama-server.exe` and confirm >10.5 GB free VRAM on the RTX 3060 12GB.\n"
-            f"   - Step C: Run `stable-diffusion.cpp` (`FLUX.1-schnell-Q5_K_S.gguf`, 4 steps, 1024x1024)"
-            f"{' with rembg/alpha-key background removal' if transparent else ''}"
-            f"{' and Sobel PBR normal/roughness/height maps' if pbr else ''}.\n"
-            f"   - Step D: Relaunch `llama-server.exe` and restore slot 0.\n"
-            f"   - Step E: Perform Closed-Loop Vision Self-Check on the downscaled preview.\n"
-            f"</think>"
-        )
-        tool_calls.append(
-            {
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "function": {
-                    "name": "generate_2d_asset",
-                    "arguments": json.dumps(
-                        {
-                            "prompt": user_prompt,
-                            "asset_type": asset_type,
-                            "output_path": out_path,
-                            "transparent_bg": transparent,
-                            "generate_pbr_maps": pbr,
-                            "width": 1024,
-                            "height": 1024,
-                            "steps": 4,
-                        }
-                    ),
-                },
-            }
-        )
-        reply = (
-            f"{thinking}\n"
-            f"Initiating **Tier 3 Atomic Image-Gen VRAM Swap** to generate `{out_path}` (`{asset_type}`)."
-        )
-        return reply, tool_calls
-
-    # 2. Check if user asked for 3D model / Blender script / .glb generation
-    if any(k in p_lower for k in ("3d", "blender", "glb", "mesh", "crate", "pillar", "sword", "turret", "run_blender_script", "model")):
-        heavy_bake = "cycles" in p_lower or "bake" in p_lower
-        out_glb = "res://assets/models/sci_fi_pillar.glb"
-        bpy_code = (
-            "import bpy\n"
-            "# Create primary visual mesh\n"
-            "bpy.ops.mesh.primitive_cylinder_add(vertices=24, radius=0.55, depth=2.2, location=(0, 0, 1.1))\n"
-            "pillar = bpy.context.active_object\n"
-            "pillar.name = 'SciFiPillar'\n"
-            "# Add top cap detail\n"
-            "bpy.ops.mesh.primitive_cube_add(size=1.3, location=(0, 0, 2.1))\n"
-            "cap = bpy.context.active_object\n"
-            "cap.scale = (1.0, 1.0, 0.18)\n"
-            "cap.name = 'SciFiPillarCap'\n"
-            "# Add Godot 4 collision mesh with -colonly suffix\n"
-            "bpy.ops.mesh.primitive_cylinder_add(vertices=12, radius=0.58, depth=2.25, location=(0, 0, 1.1))\n"
-            "col = bpy.context.active_object\n"
-            "col.name = 'SciFiPillar-colonly'\n"
-            "# Assign PBR Principled BSDF material\n"
-            "mat = bpy.data.materials.new(name='PillarMetallicMat')\n"
-            "mat.use_nodes = True\n"
-            "pillar.data.materials.append(mat)\n"
-        )
-        thinking = (
-            "<think>\n"
-            f"The user requested a 3D Godot asset: \"{user_prompt}\".\n"
-            "1. I will call `run_blender_script` which wraps the `bpy` script inside the **Godot 4 Export Harness Wrapper**.\n"
-            "2. Because `heavy_cycles_bake` is False, Blender runs concurrently in CPU/RAM mode while `LLM_ACTIVE` stays resident in VRAM.\n"
-            "3. The wrapper enforces 1.0m metric units, applies all transforms, preserves the `-colonly` collision suffix for Godot 4, "
-            "saves the `.blend` source in `blend_src/`, exports a `+Y`-up binary `.glb`, and renders a **3-Angle Visual Verification Contact Sheet**.\n"
-            "</think>"
-        )
-        tool_calls.append(
-            {
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "function": {
-                    "name": "run_blender_script",
-                    "arguments": json.dumps(
-                        {
-                            "script_code": bpy_code,
-                            "output_glb_path": out_glb,
-                            "render_preview": True,
-                            "heavy_cycles_bake": heavy_bake,
-                        }
-                    ),
-                },
-            }
-        )
-        reply = (
-            f"{thinking}\n"
-            f"Running headless Blender 4.x pipeline with the **Godot 4 Export Harness Wrapper** to create `{out_glb}`."
-        )
-        return reply, tool_calls
-
-    # 3. Check if user asked for 2-in-1 game audio (SFX or instrumental music loop)
-    if any(
-        k in p_lower
-        for k in (
-            "generate_game_audio",
-            "sfx",
-            "sound effect",
-            "audio",
-            "music",
-            "soundtrack",
-            "instrumental",
-            "laser",
-            "footstep",
-            "explosion",
-            "ambient loop",
-        )
-    ):
-        is_music = any(k in p_lower for k in ("music", "music_loop", "soundtrack", "instrumental", "ambient", "bgm", "song"))
-        mode = "music_loop" if is_music else "sfx"
-        seamless = True if is_music or "loop" in p_lower else False
-        duration = 12.0 if is_music else 2.5
-        ext = ".ogg" if is_music else ".wav"
-        sub = "music" if is_music else "sfx"
-        slug = "cyber_action_loop" if is_music else "plasma_rifle_sfx"
-        out_path = f"res://audio/{sub}/{slug}{ext}"
-
-        thinking = (
-            "<think>\n"
-            f"The user wants to generate game audio (`mode='{mode}'`): \"{user_prompt}\".\n"
-            "1. I will call `generate_game_audio` which triggers the Atomic Audio-Gen VRAM Swap:\n"
-            "   - Step A: Save KV cache slot 0 (`POST /slots/0?action=save` -> `./cache/kv_disk/`).\n"
-            "   - Step B: Unload `llama-server.exe` and verify >10.5 GB free VRAM on the RTX 3060 12GB.\n"
-            f"   - Step C: Run `stabilityai/stable-audio-open-1.0` (`StableAudioPipeline` in FP16) for `{duration}s`, "
-            + (
-                "append strictly instrumental tags, apply equal-power cosine loop crossfade (`seamless_loop=True`), and normalize peak to `-1.0 dBFS`.\n"
-                if is_music
-                else "automatically trim trailing silence and normalize peak loudness to `-1.0 dBFS`.\n"
-            )
-            + f"   - Step D: Unload audio pipeline from VRAM, relaunch `llama-server.exe`, and restore KV slot 0.\n"
-            f"   - Step E: Export 44.1 kHz stereo `{ext}` + `.import` sidecar (`loop={'true' if seamless else 'false'}`) and inspect the **Waveform + Mel-Spectrogram PNG**.\n"
-            "</think>"
-        )
-        tool_calls.append(
-            {
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "function": {
-                    "name": "generate_game_audio",
-                    "arguments": json.dumps(
-                        {
-                            "prompt": user_prompt,
-                            "mode": mode,
-                            "output_path": out_path,
-                            "duration_sec": duration,
-                            "seamless_loop": seamless,
-                            "steps": 50,
-                        }
-                    ),
-                },
-            }
-        )
-        reply = (
-            f"{thinking}\n"
-            f"Initiating **Atomic Audio-Gen VRAM Swap** (`stabilityai/stable-audio-open-1.0` FP16) to generate `{out_path}` (`mode='{mode}'`)."
-        )
-        return reply, tool_calls
-
-    # 4. Check if user asked to recall project memory / RAG search
-    if any(k in p_lower for k in ("recall_memory", "recall memory", "search memory", "what did we decide", "remember")):
-        thinking = (
-            "<think>\n"
-            f"The user wants to recall archived project history or pinned Godot 4 facts: \"{user_prompt}\".\n"
-            "I will call `recall_memory` which queries `./cache/project_memory.db` using Zero-VRAM CPU embeddings "
-            "(`BAAI/bge-small-en-v1.5` on CPU, 0 bytes VRAM) and injects retrieved snippets strictly at the bottom "
-            "of the active conversation so `llama-server` KV prefix caching is never invalidated.\n"
-            "</think>"
-        )
-        tool_calls.append(
-            {
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "function": {
-                    "name": "recall_memory",
-                    "arguments": json.dumps(
-                        {
-                            "query": user_prompt,
-                            "top_k": 4,
-                        }
-                    ),
-                },
-            }
-        )
-        reply = (
-            f"{thinking}\n"
-            "Searching Zero-VRAM Project Memory (`./cache/project_memory.db` & `.harness/MEMORY.md`) via `recall_memory`."
-        )
-        return reply, tool_calls
-
-    # 4. Check if user asked to edit or upgrade player_controller.gd / apply_diff
-    if any(k in p_lower for k in ("dash", "sprint", "double jump", "edit", "diff", "modify", "player_controller")):
-        thinking = (
-            "<think>\n"
-            "The user wants to update `res://scripts/player_controller.gd`.\n"
-            "I will use `apply_diff` so a `.bak` rollback snapshot is saved in `.harness_backups/` "
-            "and Godot 4 `--headless --check-only` GDScript validation runs automatically.\n"
-            "</think>"
-        )
-        tool_calls.append(
-            {
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "function": {
-                    "name": "apply_diff",
-                    "arguments": json.dumps(
-                        {
-                            "path": "res://scripts/player_controller.gd",
-                            "search_text": "@export var move_speed: float = 6.0\n@export var jump_velocity: float = 4.8",
-                            "replace_text": "@export var move_speed: float = 7.5\n@export var sprint_multiplier: float = 1.65\n@export var jump_velocity: float = 5.4",
-                        }
-                    ),
-                },
-            }
-        )
-        reply = (
-            f"{thinking}\n"
-            "Applying targeted diff to `res://scripts/player_controller.gd` (with automatic `.bak` snapshot & GDScript 2.0 validation)."
-        )
-        return reply, tool_calls
-
-    # 4. Default: Inspect scene & workspace files
-    thinking = (
-        "<think>\n"
-        f"Analyzing request for the Godot 4 project: \"{user_prompt}\".\n"
-        "Let's inspect `res://scenes/main_3d.tscn` using `read_file` to review the 3D Scene Graph Summary and node transforms.\n"
-        "</think>"
-    )
-    tool_calls.append(
-        {
-            "id": f"call_{uuid.uuid4().hex[:8]}",
-            "function": {
-                "name": "read_file",
-                "arguments": json.dumps(
-                    {
-                        "path": "res://scenes/main_3d.tscn",
-                        "start_line": 1,
-                        "end_line": 120,
-                    }
-                ),
-            },
-        }
-    )
-    reply = (
-        f"{thinking}\n"
-        "I've inspected `res://scenes/main_3d.tscn` and parsed its **3D Scene Graph Summary**. "
-        "You can ask me to generate 2D sprites/PBR textures (`generate_2d_asset`), model 3D `.glb` props in headless Blender (`run_blender_script`), "
-        "or modify scenes and GDScript files (`apply_diff` / `write_file`)."
-    )
-    return reply, tool_calls
-
-
-def _build_vision_self_check_followup(
-    executed_tools: List[Dict[str, Any]],
-    vision_self_checks: List[Dict[str, Any]],
-) -> str:
-    lines: List[str] = []
-    for vsc in vision_self_checks:
-        if vsc["source_tool"] == "generate_2d_asset":
-            res_p = vsc["res_path"]
-            pbr = vsc.get("pbr_maps", {})
-            lines.append(
-                f"### Closed-Loop Vision Self-Check Passed (`{res_p}`)\n"
-                f"- **Visual Inspection**: Verified framing, contrast, and palette on downscaled preview.\n"
-                + (
-                    f"- **PBR Maps Generated**: Normal (`{pbr.get('normal_map')}`), Roughness (`{pbr.get('roughness_map')}`), "
-                    f"Height (`{pbr.get('height_map')}`), and Godot 4 material resource (`{pbr.get('godot_material_tres')}`).\n"
-                    if pbr
-                    else ""
-                )
-                + f"- **Godot 4 GDScript Usage**:\n"
-                f"```gdscript\n"
-                f"var tex: Texture2D = load(\"{res_p}\")\n"
-                f"```"
-            )
-        elif vsc["source_tool"] == "run_blender_script":
-            res_glb = vsc["res_path"]
-            res_blend = vsc.get("blend_path")
-            telem = vsc.get("mesh_telemetry", {})
-            dims = telem.get("dimensions_m", [1.0, 1.0, 1.0])
-            sfx = telem.get("preserved_godot_suffixes", [])
-            sfx_str = ", ".join(f"`{s['name']}` ({s['suffix']})" for s in sfx) if sfx else "None"
-            lines.append(
-                f"### 3-Angle Visual Verification Contact Sheet Passed (`{res_glb}`)\n"
-                f"- **Visual Inspection (Front `-Y`, `3/4 Isometric`, `Wireframe/Top +Z`)**: Verified proportions (`{dims[0]}m x {dims[1]}m x {dims[2]}m`), "
-                f"recalculated outward normals (`{telem.get('triangle_count', 0)}` tris), and glTF `+Y` up orientation.\n"
-                f"- **Preserved Godot Collision Suffixes**: {sfx_str}\n"
-                f"- **Archived Source `.blend`**: `{res_blend}`\n"
-                f"- **Godot 4 Scene Instantiation**:\n"
-                f"```gdscript\n"
-                f"var prop_scene: PackedScene = load(\"{res_glb}\")\n"
-                f"var prop_instance: Node3D = prop_scene.instantiate()\n"
-                f"add_child(prop_instance)\n"
-                f"```"
-            )
-        elif vsc["source_tool"] == "generate_game_audio":
-            res_aud = vsc["res_path"]
-            mode = vsc.get("mode", "sfx")
-            am = vsc.get("audio_metrics", {})
-            imp = vsc.get("godot_import_sidecar", {})
-            node_cls = "AudioStreamPlayer" if mode == "music_loop" else "AudioStreamPlayer3D"
-            lines.append(
-                f"### Waveform + Mel-Spectrogram Vision Check Passed (`{res_aud}`)\n"
-                f"- **Envelope & Loudness Verification**: Peak `{am.get('peak_dbfs', -1.0)} dBFS`, "
-                f"RMS `{am.get('rms_dbfs', -14.0)} dBFS`, Duration `{am.get('duration_sec', 0.0)}s` @ `44,100 Hz` Stereo "
-                f"({'No silence/clipping detected' if am.get('envelope_healthy', True) else 'Envelope warning'}).\n"
-                f"- **Post-Processing**: Silence Trimmed `{am.get('silence_trimmed_sec', 0.0)}s` | "
-                f"Seamless Loop Crossfade: `{am.get('crossfade_applied', False)}` | "
-                f"Godot Sidecar `{imp.get('res_path')}` (`loop={str(imp.get('loop', False)).lower()}`).\n"
-                f"- **Godot 4 `{node_cls}` Integration**:\n"
-                f"```gdscript\n"
-                f"var audio_player := {node_cls}.new()\n"
-                f"audio_player.stream = load(\"{res_aud}\")\n"
-                f"add_child(audio_player)\n"
-                f"audio_player.play()\n"
-                f"```"
-            )
-    return "\n\n".join(lines)
 
 
 def get_full_status_snapshot() -> Dict[str, Any]:
@@ -2035,6 +1431,66 @@ async def api_chat(req: ChatRequest) -> Dict[str, Any]:
     )
 
 
+def _conversations_payload() -> Dict[str, Any]:
+    return {
+        "workspace_dir": str(tool_executor.workspace_dir),
+        "active_id": ACTIVE_CONVERSATION["id"],
+        "active_title": ACTIVE_CONVERSATION["title"],
+        "conversations": _list_conversations(),
+        "messages": _history_for_ui(),
+    }
+
+
+def _require_idle() -> None:
+    if TURN_LOCK.locked():
+        raise HTTPException(status_code=409, detail="The agent is still working. Wait for it to finish first.")
+
+
+@app.get("/api/chat/history")
+async def api_chat_history() -> Dict[str, Any]:
+    """Open conversation + the list of saved conversations for the active project."""
+    return _conversations_payload()
+
+
+@app.get("/api/conversations")
+async def api_conversations() -> Dict[str, Any]:
+    return _conversations_payload()
+
+
+@app.post("/api/chat/reset")
+@app.post("/api/conversations/new")
+async def api_conversation_new() -> Dict[str, Any]:
+    """Start a new conversation (the current one stays in the list; pinned MEMORY.md is kept)."""
+    _require_idle()
+    _persist_history()
+    _start_new_conversation()
+    return _conversations_payload()
+
+
+@app.post("/api/conversations/select")
+async def api_conversation_select(req: ConversationRequest) -> Dict[str, Any]:
+    _require_idle()
+    _persist_history()
+    if req.id != ACTIVE_CONVERSATION["id"] and not _open_conversation(req.id):
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    return _conversations_payload()
+
+
+@app.post("/api/conversations/delete")
+async def api_conversation_delete(req: ConversationRequest) -> Dict[str, Any]:
+    _require_idle()
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", req.id or ""):
+        raise HTTPException(status_code=400, detail="Invalid conversation id.")
+    path = _conversations_dir() / f"{req.id}.json"
+    if path.exists():
+        path.unlink()
+    if req.id == ACTIVE_CONVERSATION["id"]:
+        remaining = _list_conversations()
+        if not (remaining and _open_conversation(remaining[0]["id"])):
+            _start_new_conversation()
+    return _conversations_payload()
+
+
 @app.post("/api/tools/execute")
 async def api_execute_tool(req: ToolCallRequest) -> Dict[str, Any]:
     result = await tool_executor.execute_tool(
@@ -2213,6 +1669,8 @@ async def _apply_workspace_folder_switch(
             encoding="utf-8",
         )
 
+    # Each project folder keeps its own conversation: save the outgoing one, load the incoming one
+    _persist_history()
     WORKSPACE_DIR = target_path
     _save_persisted_workspace_dir(target_path)
     tool_executor.set_workspace_dir(target_path)
@@ -2221,10 +1679,7 @@ async def _apply_workspace_folder_switch(
         project_root=str(target_path),
         current_messages=CONVERSATION_HISTORY,
     )
-    if CONVERSATION_HISTORY and CONVERSATION_HISTORY[0].get("role") == "system":
-        CONVERSATION_HISTORY[0]["content"] = orchestrator.memory_rag.build_static_system_prompt(
-            BASE_SYSTEM_PROMPT
-        )
+    _load_history_from_disk()
 
     snap = get_full_status_snapshot()
     await ws_manager.broadcast("telemetry_update", snap)
