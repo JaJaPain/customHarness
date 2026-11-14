@@ -311,7 +311,7 @@ MODEL_PROFILES: Dict[str, ModelProfile] = {
         mmproj_filename="mmproj-Ornith-1.5-9B-f16.gguf",
         hf_repo="Ornith-AI/Ornith-1.5-9B-GGUF",
         hf_model_url="https://huggingface.co/Ornith-AI/Ornith-1.5-9B-GGUF/resolve/main/Ornith-1.5-9B-Q6_K.gguf",
-        hf_mmproj_url="https://huggingface.co/Ornith-AI/Ornith-1.5-9B-GGUF/resolve/main/mmproj-Ornith-1.5-9B-f16.gguf",
+        hf_mmproj_url="https://huggingface.co/AtomicChat/Ornith-1.5-9B-GGUF/resolve/main/mmproj-Ornith-1.5-9B-F16.gguf",
         default_ctx_tier1=32768,
         overflow_ctx_tier2=96000,
         vram_estimate_mb=8400,
@@ -352,6 +352,7 @@ AUDIO_MODELS: Dict[str, Dict[str, Any]] = {
         "id": "stable-audio-open",
         "display_name": "Stable Audio Open 1.0 [FP16]",
         "repo_id": "stabilityai/stable-audio-open-1.0",
+        "fallback_repo_id": "cudabenchmarktest/stable-audio-open-1.0",
         "local_dir": "stable-audio-open-1.0",
         "hf_url": "https://huggingface.co/stabilityai/stable-audio-open-1.0",
         "sample_rate_hz": 44100,
@@ -834,7 +835,14 @@ class VRAMOrchestrator:
         return local_bin
 
     def get_sd_binary_path(self) -> Path:
-        for name in ("sd.exe", "sd-server.exe"):
+        sd_cli = self.bin_dir / "sd-cli.exe"
+        sd_exe = self.bin_dir / "sd.exe"
+        if sd_cli.exists() and not sd_exe.exists():
+            try:
+                shutil.copy2(sd_cli, sd_exe)
+            except Exception:
+                pass
+        for name in ("sd-cli.exe", "sd.exe", "sd-server.exe"):
             candidate = self.bin_dir / name
             if candidate.exists():
                 return candidate
@@ -1829,58 +1837,95 @@ class VRAMOrchestrator:
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """
-        Query GitHub Releases API for llama.cpp or stable-diffusion.cpp, locate the Windows
-        CUDA 12.x x64 zip bundle, download it, and extract .exe + .dll files into ./bin/.
+        Query GitHub Releases API for llama.cpp or stable-diffusion.cpp, locate the newest release
+        that has finished uploading Windows x64 CUDA zip assets, download it, and extract .exe + .dll files into ./bin/.
         """
         import zipfile
 
         repo = (
-            "ggerganov/llama.cpp"
+            "ggml-org/llama.cpp"
             if item_id in ("llama-server", "llama_server")
             else "leejet/stable-diffusion.cpp"
         )
-        api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+        api_url = f"https://api.github.com/repos/{repo}/releases?per_page=10"
         self._update_download_job(
             job_key,
             progress_cb,
             status="resolving_release",
-            message=f"Querying {api_url} for Windows CUDA x64 release assets...",
+            message=f"Querying {repo} releases for Windows CUDA x64 assets...",
         )
 
         async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
             resp = await client.get(api_url, headers={"User-Agent": "Godot4-Local-Harness/1.0"})
             resp.raise_for_status()
-            release_data = resp.json()
+            releases_list = resp.json()
+            if isinstance(releases_list, dict):
+                releases_list = [releases_list]
 
-        assets = release_data.get("assets", [])
         chosen_assets: List[Dict[str, Any]] = []
+        chosen_release: Dict[str, Any] = {}
 
-        if "llama.cpp" in repo:
-            for a in assets:
-                name_l = a.get("name", "").lower()
-                if name_l.endswith(".zip") and "win" in name_l and "x64" in name_l and ("cuda" in name_l or "cudart" in name_l):
-                    if "cu12" in name_l or "cuda-12" in name_l or "cudart" in name_l:
-                        chosen_assets.append(a)
-            if not chosen_assets:
+        for rel in releases_list:
+            assets = rel.get("assets", [])
+            if not assets:
+                continue
+
+            if "llama.cpp" in repo:
+                cuda_bins = [
+                    a for a in assets
+                    if a.get("name", "").lower().endswith(".zip")
+                    and "win" in a.get("name", "").lower()
+                    and "x64" in a.get("name", "").lower()
+                    and "cuda" in a.get("name", "").lower()
+                    and not a.get("name", "").lower().startswith("cudart")
+                ]
+                cudart_bins = [
+                    a for a in assets
+                    if a.get("name", "").lower().endswith(".zip")
+                    and "win" in a.get("name", "").lower()
+                    and "x64" in a.get("name", "").lower()
+                    and a.get("name", "").lower().startswith("cudart")
+                ]
+                if cuda_bins:
+                    # Prefer CUDA 12.x if multiple CUDA versions are present, otherwise take the first CUDA x64 zip
+                    cu12 = [a for a in cuda_bins if "12." in a.get("name", "").lower() or "cu12" in a.get("name", "").lower()]
+                    primary_bin = cu12[0] if cu12 else cuda_bins[0]
+                    chosen_assets = [primary_bin]
+                    if cudart_bins:
+                        cu12_rt = [a for a in cudart_bins if "12." in a.get("name", "").lower() or "cu12" in a.get("name", "").lower()]
+                        chosen_assets.append(cu12_rt[0] if cu12_rt else cudart_bins[0])
+                    chosen_release = rel
+                    break
+
+                # Fallback to Vulkan or CPU x64 zip if no CUDA zip in this release
+                fallback_bins = [
+                    a for a in assets
+                    if a.get("name", "").lower().endswith(".zip")
+                    and "win" in a.get("name", "").lower()
+                    and "x64" in a.get("name", "").lower()
+                    and ("vulkan" in a.get("name", "").lower() or "cpu" in a.get("name", "").lower() or "avx2" in a.get("name", "").lower())
+                ]
+                if fallback_bins:
+                    chosen_assets = [fallback_bins[0]]
+                    chosen_release = rel
+                    break
+            else:
                 for a in assets:
                     name_l = a.get("name", "").lower()
-                    if name_l.endswith(".zip") and "win" in name_l and "x64" in name_l and ("vulkan" in name_l or "avx2" in name_l):
+                    if name_l.endswith(".zip") and "win" in name_l and "x64" in name_l and ("cuda" in name_l or "cudart" in name_l):
                         chosen_assets.append(a)
-                        break
-        else:
-            for a in assets:
-                name_l = a.get("name", "").lower()
-                if name_l.endswith(".zip") and "win" in name_l and "x64" in name_l and ("cuda" in name_l or "cudart" in name_l):
-                    chosen_assets.append(a)
-            if not chosen_assets:
-                for a in assets:
-                    name_l = a.get("name", "").lower()
-                    if name_l.endswith(".zip") and "win" in name_l and "x64" in name_l:
-                        chosen_assets.append(a)
-                        break
+                if not chosen_assets:
+                    for a in assets:
+                        name_l = a.get("name", "").lower()
+                        if name_l.endswith(".zip") and "win" in name_l and "x64" in name_l:
+                            chosen_assets.append(a)
+                            break
+                if chosen_assets:
+                    chosen_release = rel
+                    break
 
         if not chosen_assets:
-            raise RuntimeError(f"Could not find Windows x64 .zip asset in {repo} latest release.")
+            raise RuntimeError(f"Could not find Windows x64 .zip asset in recent {repo} releases.")
 
         extracted_files: List[str] = []
         for asset in chosen_assets[:2]:
@@ -1914,9 +1959,19 @@ class VRAMOrchestrator:
             except Exception:
                 pass
 
+        # Ensure sd.exe alias exists if sd-cli.exe was extracted
+        sd_cli = self.bin_dir / "sd-cli.exe"
+        sd_exe = self.bin_dir / "sd.exe"
+        if sd_cli.exists() and not sd_exe.exists():
+            try:
+                shutil.copy2(sd_cli, sd_exe)
+                extracted_files.append("sd.exe")
+            except Exception:
+                pass
+
         return {
             "repo": repo,
-            "tag": release_data.get("tag_name"),
+            "tag": chosen_release.get("tag_name"),
             "extracted_files": extracted_files,
             "bin_dir": str(self.bin_dir),
         }
@@ -1953,24 +2008,34 @@ class VRAMOrchestrator:
                 prof = MODEL_PROFILES[item_id]
                 downloaded_paths: List[str] = []
                 model_dest = self.models_dir / prof.model_filename
-                await self._stream_file_download(
-                    job_key=job_key,
-                    url=prof.hf_model_url,
-                    dest_path=model_dest,
-                    hf_token=hf_token,
-                    progress_cb=progress_cb,
-                )
-                downloaded_paths.append(str(model_dest))
-                if prof.mmproj_filename and prof.hf_mmproj_url:
-                    mmproj_dest = self.models_dir / prof.mmproj_filename
+                if not (model_dest.exists() and model_dest.stat().st_size > 50 * 1024 * 1024):
                     await self._stream_file_download(
                         job_key=job_key,
-                        url=prof.hf_mmproj_url,
-                        dest_path=mmproj_dest,
+                        url=prof.hf_model_url,
+                        dest_path=model_dest,
                         hf_token=hf_token,
                         progress_cb=progress_cb,
                     )
-                    downloaded_paths.append(str(mmproj_dest))
+                downloaded_paths.append(str(model_dest))
+
+                if prof.mmproj_filename and prof.hf_mmproj_url:
+                    mmproj_dest = self.models_dir / prof.mmproj_filename
+                    if not (mmproj_dest.exists() and mmproj_dest.stat().st_size > 1024 * 1024):
+                        try:
+                            await self._stream_file_download(
+                                job_key=job_key,
+                                url=prof.hf_mmproj_url,
+                                dest_path=mmproj_dest,
+                                hf_token=hf_token,
+                                progress_cb=progress_cb,
+                            )
+                            downloaded_paths.append(str(mmproj_dest))
+                        except Exception as mm_exc:
+                            logger.info(
+                                f"Optional mmproj weight ({prof.mmproj_filename}) not present at {prof.hf_mmproj_url}: {mm_exc}; continuing with main GGUF."
+                            )
+                    else:
+                        downloaded_paths.append(str(mmproj_dest))
 
                 return self._update_download_job(
                     job_key,
@@ -1978,50 +2043,66 @@ class VRAMOrchestrator:
                     status="completed",
                     percent=100.0,
                     files=downloaded_paths,
-                    message=f"Downloaded {prof.display_name} to {self.models_dir}",
+                    message=f"Ready: {prof.model_filename} in {self.models_dir}",
                 )
 
             if category == "image_model" and item_id in IMAGE_MODELS:
                 imod = IMAGE_MODELS[item_id]
                 dest = self.models_dir / imod["filename"]
-                await self._stream_file_download(
-                    job_key=job_key,
-                    url=imod["hf_url"],
-                    dest_path=dest,
-                    hf_token=hf_token,
-                    progress_cb=progress_cb,
-                )
+                if not (dest.exists() and dest.stat().st_size > 50 * 1024 * 1024):
+                    await self._stream_file_download(
+                        job_key=job_key,
+                        url=imod["hf_url"],
+                        dest_path=dest,
+                        hf_token=hf_token,
+                        progress_cb=progress_cb,
+                    )
                 return self._update_download_job(
                     job_key,
                     progress_cb,
                     status="completed",
                     percent=100.0,
                     files=[str(dest)],
-                    message=f"Downloaded {imod['display_name']} to {dest}",
+                    message=f"Ready: {imod['display_name']} in {dest}",
                 )
 
             if category == "audio_model" and item_id in AUDIO_MODELS:
                 amod = AUDIO_MODELS[item_id]
                 target_dir = self.models_dir / amod["local_dir"]
                 target_dir.mkdir(parents=True, exist_ok=True)
-                token = hf_token or os.environ.get("HF_TOKEN")
+                token = (hf_token or os.environ.get("HF_TOKEN") or "").strip() or None
+                primary_repo = amod["repo_id"]
+                fallback_repo = amod.get("fallback_repo_id", "cudabenchmarktest/stable-audio-open-1.0")
+                chosen_repo = primary_repo if token else fallback_repo
+
                 self._update_download_job(
                     job_key,
                     progress_cb,
                     status="downloading",
-                    current_file=amod["repo_id"],
-                    message=f"Downloading {amod['repo_id']} snapshot into {target_dir}...",
+                    current_file=chosen_repo,
+                    message=f"Downloading {chosen_repo} snapshot into {target_dir}...",
                 )
 
                 def _run_hf_snapshot() -> str:
                     from huggingface_hub import snapshot_download  # type: ignore
 
-                    return snapshot_download(
-                        repo_id=amod["repo_id"],
-                        local_dir=str(target_dir),
-                        token=token,
-                        ignore_patterns=["*.ckpt", "*.bin"],
-                    )
+                    try:
+                        return snapshot_download(
+                            repo_id=chosen_repo,
+                            local_dir=str(target_dir),
+                            token=token if chosen_repo == primary_repo else None,
+                            ignore_patterns=["*.ckpt", "*.bin"],
+                        )
+                    except Exception as first_err:
+                        if chosen_repo != fallback_repo:
+                            logger.info(f"Gated repo {primary_repo} failed ({first_err}); falling back to ungated mirror {fallback_repo}...")
+                            return snapshot_download(
+                                repo_id=fallback_repo,
+                                local_dir=str(target_dir),
+                                token=None,
+                                ignore_patterns=["*.ckpt", "*.bin"],
+                            )
+                        raise
 
                 snap_path = await asyncio.to_thread(_run_hf_snapshot)
                 return self._update_download_job(

@@ -1369,6 +1369,16 @@ function handleDownloadProgress(job) {
       statusEl.innerHTML = `<span style="color:#38bdf8;">⬇ ${escapeHtml(job.current_file || "")} ${pct} — ${mb}${tot}${spd}</span>`;
     } else if (job.status === "completed") {
       statusEl.innerHTML = `<span style="color:#34d399;">✓ ${escapeHtml(job.message || "Download Complete")}</span>`;
+      const modal = document.getElementById("setup-modal");
+      if (modal && !modal.classList.contains("hidden")) {
+        setTimeout(() => {
+          const savedToken = document.getElementById("setup-hf-token")?.value || "";
+          openSetupModal().then(() => {
+            const inputAfter = document.getElementById("setup-hf-token");
+            if (inputAfter && savedToken) inputAfter.value = savedToken;
+          });
+        }, 500);
+      }
     } else if (job.status === "error") {
       statusEl.innerHTML = `<span style="color:#f87171;">✗ ${escapeHtml(job.error || "Download Failed")}</span>`;
     } else {
