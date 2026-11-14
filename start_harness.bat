@@ -1,7 +1,5 @@
 @echo off
-setlocal enabledelayedexpansion
-title Godot 4 Local Agentic Coding ^& 2D/3D Asset Harness (RTX 3060 12GB)
-
+title Godot 4 Local Agentic Coding and 2D/3D Asset Harness
 cd /d "%~dp0"
 
 echo ============================================================================
@@ -17,25 +15,40 @@ if not exist "cache\slots" mkdir "cache\slots"
 if not exist "cache\kv_disk" mkdir "cache\kv_disk"
 if not exist "workspace" mkdir "workspace"
 
-where python >nul 2>nul
-if %errorlevel% neq 0 (
-    echo [ERROR] Python 3.10+ not found in PATH. Please install Python 3.10+ for Windows.
-    pause
-    exit /b 1
-)
+set "PYTHON_EXE=python"
+if exist ".venv\Scripts\python.exe" set "PYTHON_EXE=.venv\Scripts\python.exe"
 
-if not exist ".venv\Scripts\python.exe" (
-    echo [1/3] Creating local Python virtual environment (.venv)...
-    python -m venv .venv
-)
+%PYTHON_EXE% --version >nul 2>nul
+if errorlevel 1 goto :no_python
 
-echo [2/3] Verifying Python dependencies from requirements.txt...
-call ".venv\Scripts\activate.bat"
-python -m pip install --upgrade pip --quiet
-python -m pip install -r requirements.txt --quiet
+echo [1/2] Checking core Python dependencies...
+%PYTHON_EXE% -c "import fastapi, uvicorn, websockets, httpx, pydantic, psutil, PIL, numpy" >nul 2>nul
+if errorlevel 1 goto :install_deps
+goto :launch_server
 
-echo [3/3] Starting FastAPI + WebSockets Harness Server on http://127.0.0.1:8000 ...
-start "" http://127.0.0.1:8000
-python server.py
+:install_deps
+echo [1/2] Installing required Python packages from requirements.txt...
+%PYTHON_EXE% -m pip install -r requirements.txt
+if errorlevel 1 goto :pip_failed
 
+:launch_server
+echo [2/2] Starting FastAPI + WebSockets Harness Server on http://127.0.0.1:8000 ...
+echo       (Your browser will open automatically once the server is listening)
+echo.
+set "HARNESS_OPEN_BROWSER=1"
+%PYTHON_EXE% -u server.py
+echo.
+echo [INFO] Server stopped.
 pause
+exit /b 0
+
+:no_python
+echo [ERROR] Python 3.10+ was not found on your PATH.
+echo Please install Python 3.10+ for Windows and ensure it is added to PATH.
+pause
+exit /b 1
+
+:pip_failed
+echo [ERROR] Failed to install required Python dependencies.
+pause
+exit /b 1
