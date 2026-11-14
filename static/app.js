@@ -1498,7 +1498,7 @@ async function openSetupModal() {
           <div>
             <strong>${escapeHtml(m.display_name)}</strong>
             <div style="color:#94a3b8; font-size:10.5px;">${escapeHtml(m.path)} (${escapeHtml(m.repo_id)})</div>
-            <div style="color:#eab308; font-size:10px;">${escapeHtml(m.gated_note || "")}</div>
+            ${!m.exists && m.gated_note ? `<div style="color:#eab308; font-size:10px;">${escapeHtml(m.gated_note)}</div>` : ""}
             <div id="dl-status-${jobId}" style="font-size:10.5px; margin-top:2px;"></div>
           </div>
           <div style="display:flex; align-items:center; gap:8px;">
