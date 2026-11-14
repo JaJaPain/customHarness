@@ -518,6 +518,21 @@ class AgentToolExecutor:
         self._pending_commands: Dict[str, Dict[str, Any]] = {}
         self._cached_godot_exe: Optional[str] = None
 
+    def set_workspace_dir(self, new_workspace: str | Path) -> Path:
+        """Switch the active Godot 4 project workspace directory across all tool workers."""
+        resolved = Path(new_workspace).resolve()
+        resolved.mkdir(parents=True, exist_ok=True)
+        self.workspace_dir = resolved
+        self.backup_dir = self.workspace_dir / ".harness_backups"
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        if self.image_worker is not None:
+            self.image_worker.workspace_dir = resolved
+        if self.blender_worker is not None:
+            self.blender_worker.workspace_dir = resolved
+        if self.audio_worker is not None:
+            self.audio_worker.workspace_dir = resolved
+        return resolved
+
     # -------------------------------------------------------------------------
     # Path Resolution & Godot Binary Detection
     # -------------------------------------------------------------------------

@@ -696,15 +696,21 @@ class AudioGenWorker:
             try:
                 import soundfile as sf  # type: ignore
 
-                sf.write(
+                # Write in 4096-frame chunks so Windows libsndfile's Vorbis encoder
+                # never overflows its internal analysis buffer on long music loops (e.g. 24s-45s).
+                chunk_frames = 4096
+                with sf.SoundFile(
                     str(output_path),
-                    interleaved,
-                    sample_rate,
+                    mode="w",
+                    samplerate=sample_rate,
+                    channels=2,
                     format="OGG",
                     subtype="VORBIS",
-                )
+                ) as ogg_file:
+                    for idx in range(0, len(interleaved), chunk_frames):
+                        ogg_file.write(interleaved[idx : idx + chunk_frames])
                 return {
-                    "writer": "soundfile_ogg_vorbis",
+                    "writer": "soundfile_ogg_vorbis_chunked",
                     "size_bytes": output_path.stat().st_size,
                 }
             except Exception as exc:

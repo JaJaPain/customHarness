@@ -36,11 +36,19 @@ function initWebSocket() {
       const msg = JSON.parse(evt.data);
       if (msg.type === "telemetry_update") {
         updateTelemetryUI(msg.data);
+      } else if (msg.type === "step_start") {
+        handleLiveStepStart(msg.data);
+      } else if (msg.type === "tool_start") {
+        handleLiveToolStart(msg.data);
       } else if (msg.type === "tool_complete") {
+        handleLiveToolComplete(msg.data);
         loadWorkspaceTree();
         loadDiffHistory();
       } else if (msg.type === "download_progress") {
         handleDownloadProgress(msg.data);
+      } else if (msg.type === "workspace_changed") {
+        loadWorkspaceTree();
+        loadDiffHistory();
       }
     } catch (err) {
       console.error("WS parse error:", err);
@@ -129,6 +137,14 @@ function updateTelemetryUI(data) {
   const tierLabel = data.state === "HYBRID_RAM_OVERFLOW" ? "Tier 2 96k RAM Overflow" : "Tier 1 Fast VRAM";
   document.getElementById("ctx-token-badge").textContent =
     `Ctx: ~${ctxTokens.toLocaleString()} / ${maxCtx.toLocaleString()} tok (${tierLabel})`;
+
+  if (data.workspace_dir) {
+    const wsBar = document.getElementById("active-workspace-path-bar");
+    if (wsBar) {
+      wsBar.textContent = `📁 ${data.workspace_dir}`;
+      wsBar.title = `Active Godot 4 Project Folder: ${data.workspace_dir}`;
+    }
+  }
 
   // Update State Machine Grid on Tab 3
   document.querySelectorAll("#state-machine-grid .state-node").forEach((node) => {
@@ -483,12 +499,136 @@ function bindUIEvents() {
     });
   }
 
+  // Project Folder Picker Modal
+  const btnFolderModal = document.getElementById("btn-folder-modal");
+  if (btnFolderModal) btnFolderModal.addEventListener("click", () => openFolderModal());
+  const btnFolderInline = document.getElementById("btn-change-folder-inline");
+  if (btnFolderInline) btnFolderInline.addEventListener("click", () => openFolderModal());
+  const btnCloseFolder = document.getElementById("btn-close-folder-modal");
+  if (btnCloseFolder) {
+    btnCloseFolder.addEventListener("click", () => {
+      document.getElementById("folder-modal").classList.add("hidden");
+    });
+  }
+
   // Setup & Health Check Modal
   document.getElementById("btn-setup-modal").addEventListener("click", openSetupModal);
   document.getElementById("btn-close-modal").addEventListener("click", () => {
     document.getElementById("setup-modal").classList.add("hidden");
   });
 }
+
+// ============================================================================
+// Project Folder Picker & Directory Browser Modal
+// ============================================================================
+window.openFolderModal = async function (browsePath = null) {
+  const modal = document.getElementById("folder-modal");
+  const body = document.getElementById("folder-modal-body");
+  modal.classList.remove("hidden");
+  body.innerHTML = "Loading directories...";
+
+  try {
+    const [infoRes, browseRes] = await Promise.all([
+      fetch("/api/workspace/info"),
+      fetch("/api/workspace/browse", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ folder_path: browsePath }),
+      }),
+    ]);
+    const info = await infoRes.json();
+    const browse = await browseRes.json();
+
+    const driveButtons = (browse.drives || [])
+      .map(
+        (d) =>
+          `<button class="mini-btn" onclick="openFolderModal('${escapeHtml(d.replace(/\\/g, "\\\\"))}')">💾 ${escapeHtml(d)}</button>`
+      )
+      .join(" ");
+
+    const subdirRows = (browse.subdirs || [])
+      .map((sd) => {
+        const escapedPath = escapeHtml(sd.path.replace(/\\/g, "\\\\"));
+        return `
+        <div class="setup-row" style="padding:6px 8px;">
+          <div style="cursor:pointer; flex:1;" onclick="openFolderModal('${escapedPath}')">
+            <strong>📁 ${escapeHtml(sd.name)}</strong>
+            ${sd.has_project_godot ? `<span style="color:#34d399; font-size:10.5px; margin-left:6px;">[Godot 4 Project]</span>` : ""}
+            <div style="color:#94a3b8; font-size:10px;">${escapeHtml(sd.path)}</div>
+          </div>
+          <button class="mini-btn" onclick="selectProjectFolder('${escapedPath}')">✓ Use This Folder</button>
+        </div>`;
+      })
+      .join("");
+
+    const escapedParent = escapeHtml((browse.parent_dir || "").replace(/\\/g, "\\\\"));
+    const escapedCurrent = escapeHtml((browse.current_dir || "").replace(/\\/g, "\\\\"));
+
+    body.innerHTML = `
+      <div style="padding:10px; background:#0f172a; border:1px solid #1e293b; border-radius:6px; margin-bottom:12px;">
+        <div style="font-size:11px; color:#94a3b8; margin-bottom:4px;">
+          Current Active Godot 4 Project Folder: <strong style="color:#38bdf8;">${escapeHtml(info.workspace_dir)}</strong>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center; margin-top:8px;">
+          <input id="folder-manual-input" type="text" value="${escapeHtml(browse.current_dir || info.workspace_dir)}" placeholder="Enter or paste any folder path (e.g. D:\\GodotProjects\\MyGame)..." style="flex:1; padding:6px 10px; background:#1e293b; color:#e2e8f0; border:1px solid #334155; border-radius:4px; font-family:var(--font-mono); font-size:11.5px;" />
+          <button class="primary-btn" style="padding:6px 12px; white-space:nowrap;" onclick="selectProjectFolder(document.getElementById('folder-manual-input').value)">
+            ✓ Set Active Folder
+          </button>
+          <button class="mini-btn" style="padding:6px 10px; white-space:nowrap;" onclick="pickNativeWindowsFolder()">
+            🪟 Windows Folder Dialog...
+          </button>
+        </div>
+      </div>
+
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; gap:8px;">
+        <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+          <button class="mini-btn" onclick="openFolderModal('${escapedParent}')">⬆ Up One Level</button>
+          ${driveButtons}
+        </div>
+        <button class="mini-btn" style="color:#34d399; border-color:#059669;" onclick="selectProjectFolder('${escapedCurrent}')">
+          ✓ Select Current Browsed Folder (${escapeHtml(browse.current_dir)})
+        </button>
+      </div>
+
+      <div style="max-height:320px; overflow-y:auto; border:1px solid #1e293b; border-radius:6px; padding:4px;">
+        ${subdirRows || `<div style="padding:12px; color:#94a3b8; font-size:11.5px;">No subdirectories inside ${escapeHtml(browse.current_dir)}. Click "Set Active Folder" above to use this folder.</div>`}
+      </div>
+    `;
+  } catch (err) {
+    body.innerHTML = `<div style="color:#f87171;">Failed to browse folders: ${escapeHtml(String(err))}</div>`;
+  }
+};
+
+window.selectProjectFolder = async function (folderPath) {
+  if (!folderPath || !folderPath.trim()) return;
+  try {
+    const res = await fetch("/api/workspace/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folder_path: folderPath.trim(), init_starter_if_empty: false }),
+    });
+    const data = await res.json();
+    if (data.telemetry) updateTelemetryUI(data.telemetry);
+    document.getElementById("folder-modal").classList.add("hidden");
+    await Promise.all([loadWorkspaceTree(), loadDiffHistory()]);
+  } catch (err) {
+    console.error("Failed to switch folder:", err);
+  }
+};
+
+window.pickNativeWindowsFolder = async function () {
+  try {
+    const res = await fetch("/api/workspace/pick_native", { method: "POST" });
+    const data = await res.json();
+    if (data.status === "success") {
+      if (data.telemetry) updateTelemetryUI(data.telemetry);
+      document.getElementById("folder-modal").classList.add("hidden");
+      await Promise.all([loadWorkspaceTree(), loadDiffHistory()]);
+    }
+  } catch (err) {
+    console.error("Native folder dialog failed:", err);
+  }
+};
 
 async function uploadAndIngestFiles(files) {
   const formData = new FormData();
@@ -537,8 +677,63 @@ function renderAttachmentTray() {
 }
 
 // ============================================================================
-// Agentic Chat Execution & Collapsible <think> / Preview Cards
+// Agentic Chat Execution & Live Step/Tool Progress Feedback
 // ============================================================================
+function handleLiveStepStart(data) {
+  const statusHeader = document.getElementById("active-progress-header");
+  const sendBtn = document.getElementById("btn-send");
+  if (statusHeader && data) {
+    statusHeader.innerHTML = `⚡ <strong>Autonomous ReAct Step ${data.step} / ${data.max_steps || 12}</strong> — Planning &amp; Selecting Tools...`;
+  }
+  if (sendBtn && sendBtn.disabled && data) {
+    sendBtn.textContent = `Step ${data.step}...`;
+  }
+}
+
+function handleLiveToolStart(data) {
+  if (!data) return;
+  const listEl = document.getElementById("active-progress-list");
+  const statusHeader = document.getElementById("active-progress-header");
+  const sendBtn = document.getElementById("btn-send");
+  const hint = data.target_hint ? ` → <code>${escapeHtml(data.target_hint)}</code>` : "";
+
+  if (statusHeader) {
+    statusHeader.innerHTML = `⚡ <strong>Step ${data.step || 1} (${data.tool_index || 1}/${data.tool_count || 1})</strong> — Running <code>${escapeHtml(data.name)}</code>${hint}...`;
+  }
+  if (sendBtn && sendBtn.disabled) {
+    sendBtn.textContent = `Running ${data.name}...`;
+  }
+  if (listEl) {
+    const row = document.createElement("div");
+    row.id = `live-tool-${data.id}`;
+    row.style.cssText = "padding:3px 0; font-size:11.5px; color:#93c5fd;";
+    row.innerHTML = `⏳ <strong>[Step ${data.step || 1}]</strong> <code>${escapeHtml(data.name)}</code>${hint} <em>(in progress...)</em>`;
+    listEl.appendChild(row);
+    const stream = document.getElementById("chat-stream");
+    if (stream) stream.scrollTop = stream.scrollHeight;
+  }
+}
+
+function handleLiveToolComplete(data) {
+  if (!data) return;
+  const row = document.getElementById(`live-tool-${data.id}`);
+  const hint = data.target_hint ? ` → <code>${escapeHtml(data.target_hint)}</code>` : "";
+  const elapsed = data.elapsed_sec != null ? ` (${data.elapsed_sec}s)` : "";
+  const ok = data.result?.status !== "error";
+  if (row) {
+    row.style.color = ok ? "#34d399" : "#f87171";
+    row.innerHTML = `${ok ? "✓" : "✗"} <strong>[Step ${data.step || 1}]</strong> <code>${escapeHtml(data.name)}</code>${hint}${escapeHtml(elapsed)}`;
+  }
+  if (
+    data.result &&
+    (data.name === "generate_2d_asset" ||
+      data.name === "run_blender_script" ||
+      data.name === "generate_game_audio")
+  ) {
+    appendGalleryItem(data.name, data.result);
+  }
+}
+
 async function sendChatPrompt(promptText, simulateContextTokens = null) {
   const stream = document.getElementById("chat-stream");
   const input = document.getElementById("prompt-input");
@@ -563,7 +758,24 @@ async function sendChatPrompt(promptText, simulateContextTokens = null) {
     <div class="msg-body">${escapeHtml(promptText)}${attBadges ? `<div style="margin-top:6px">${attBadges}</div>` : ""}</div>
   `;
   stream.appendChild(userDiv);
-  stream.scrollTop = stream.scrollHeight;
+
+  // Append Live In-Progress Execution Card
+  const progressCard = document.createElement("div");
+  progressCard.id = "active-progress-card";
+  progressCard.className = "msg msg-assistant";
+  progressCard.style.borderLeft = "3px solid #38bdf8";
+  progressCard.innerHTML = `
+    <div class="msg-header">
+      <span class="msg-role" style="color:#38bdf8;">⚡ HARNESS EXECUTING PIPELINE</span>
+      <span class="msg-meta">Live WebSocket Stream</span>
+    </div>
+    <div id="active-progress-header" style="font-size:12px; color:#e2e8f0; margin-bottom:6px;">
+      ⚡ Initializing ReAct loop &amp; checking VRAM state...
+    </div>
+    <div id="active-progress-list" style="border-top:1px solid #1e293b; padding-top:6px; max-height:220px; overflow-y:auto;"></div>
+  `;
+  stream.appendChild(progressCard);
+  progressCard.scrollIntoView({ behavior: "smooth", block: "end" });
 
   sendBtn.disabled = true;
   sendBtn.textContent = "Running...";
@@ -579,15 +791,23 @@ async function sendChatPrompt(promptText, simulateContextTokens = null) {
       }),
     });
     const data = await res.json();
-    appendAssistantTurnCard(data);
+    const existingProg = document.getElementById("active-progress-card");
+    if (existingProg) existingProg.remove();
+    const assistantCard = appendAssistantTurnCard(data);
+    if (assistantCard) {
+      assistantCard.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
     if (data.vram_telemetry) updateTelemetryUI(data.vram_telemetry);
     await Promise.all([loadWorkspaceTree(), loadDiffHistory()]);
   } catch (err) {
     console.error("Chat error:", err);
+    const existingProg = document.getElementById("active-progress-card");
+    if (existingProg) {
+      existingProg.innerHTML = `<div style="color:#f87171;">✗ Error executing turn: ${escapeHtml(String(err))}</div>`;
+    }
   } finally {
     sendBtn.disabled = false;
     sendBtn.textContent = "Send ↵";
-    stream.scrollTop = stream.scrollHeight;
   }
 }
 
@@ -626,13 +846,7 @@ function appendAssistantTurnCard(data) {
   `;
 
   stream.appendChild(card);
-
-  // Also add any generated 2D/3D previews into the right-pane Studio Gallery
-  for (const tc of data.tool_calls || []) {
-    if (tc.name === "generate_2d_asset" || tc.name === "run_blender_script") {
-      appendGalleryItem(tc.name, tc.result);
-    }
-  }
+  return card;
 }
 
 function renderToolCallCard(tc) {
@@ -667,6 +881,16 @@ function renderToolCallCard(tc) {
           <code style="margin-left:6px;">${escapeHtml(res.res_glb_path || "")}</code>
         </div>
         <img src="${res.contact_sheet.image_url}" alt="3-Angle Blender Contact Sheet" />
+      </div>
+    `;
+  } else if (tc.name === "generate_game_audio" && res.closed_loop_vision_check?.image_url) {
+    previewHtml = `
+      <div class="preview-card">
+        <div>
+          <span class="badge-vision-check">✓ Waveform + Mel-Spectrogram Vision Check Passed</span>
+          <code style="margin-left:6px;">${escapeHtml(res.res_path || "")}</code>
+        </div>
+        <img src="${res.closed_loop_vision_check.image_url}" alt="Audio Waveform and Mel-Spectrogram" />
       </div>
     `;
   } else if (res.status === "approval_required" && res.cmd_id) {

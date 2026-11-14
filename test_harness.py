@@ -341,26 +341,79 @@ def test_full_async_pipeline():
         assert proj_val["exit_code"] == 0
         assert proj_val["valid"] is True
 
-        # 4. Verify Multi-Step Autonomous ReAct Loop + Batched VRAM Swap Deferral across all phases
+        # 4. Verify Full 5-Phase "Nebula Breaker" Game Build via Multi-Step Autonomous ReAct Loop
+        nebula_prompt = (
+            'Build a complete, playable 3D arcade Brick-Breaker game ("Nebula Breaker") in Godot 4 from scratch inside this project folder.\n'
+            "1. Generate 2D Textures & UI Art (`generate_2d_asset`):\n"
+            "   - `res://assets/textures/arena_floor.png` (`asset_type=\"seamless_texture\"`, `generate_pbr_maps=True`)\n"
+            "   - `res://assets/textures/brick_albedo.png` (`asset_type=\"seamless_texture\"`)\n"
+            "   - `res://assets/ui/powerup_icon.png` (`asset_type=\"ui_icon\"`, `transparent_bg=True`)\n"
+            "2. Build 3D Assets in Headless Blender (`run_blender_script`):\n"
+            "   - `res://assets/models/paddle.glb`\n"
+            "   - `res://assets/models/brick.glb`\n"
+            "   - `res://assets/models/arena_frame.glb`\n"
+            "3. Synthesize Sound Effects & Instrumental Music (`generate_game_audio`):\n"
+            "   - `res://assets/audio/sfx_paddle_hit.wav` (`mode=\"sfx\"`, `duration_sec=1.0`)\n"
+            "   - `res://assets/audio/sfx_brick_break.wav` (`mode=\"sfx\"`, `duration_sec=1.5`)\n"
+            "   - `res://assets/audio/bgm_synthwave.ogg` (`mode=\"music_loop\"`, `duration_sec=24.0`, `seamless_loop=True`)\n"
+            "4. Assemble Scenes, Scripts & Validate (`write_file`, `apply_diff`, `run_command`):\n"
+            "   - Configure `project.godot` with the main scene (`res://scenes/main.tscn`), input actions (`move_left`, `move_right`, `launch_ball`).\n"
+            "   - Build clean, decoupled scenes and scripts (`main.tscn`, `paddle.gd`, `ball.gd`, `brick.gd`, `powerup.gd`, `hud.tscn`).\n"
+            "   - Run Godot headless syntax/error validation (`godot --headless --quit`)."
+        )
         multi_res = await run_agent_turn(
-            user_prompt=(
-                "Build a vertical slice: generate `res://assets/textures/arena_floor.png` (PBR) and "
-                "`res://assets/ui/powerup_icon.png` (ui_icon), model `res://assets/models/paddle.glb` in Blender, "
-                "synthesize `res://assets/audio/sfx_paddle_hit.wav`, and validate with `godot --headless --quit`."
-            ),
+            user_prompt=nebula_prompt,
             attachments=[],
-            max_steps=8,
+            max_steps=12,
         )
         called_names = [tc["name"] for tc in multi_res["tool_calls"]]
         assert "generate_2d_asset" in called_names
         assert "run_blender_script" in called_names
         assert "generate_game_audio" in called_names
+        assert "write_file" in called_names
         assert "run_command" in called_names
-        # Verify the first of two consecutive 2D asset calls deferred LLM restore (batched VRAM swap)
+
+        # Verify batched VRAM swap deferral across consecutive 2D & Audio calls
         two_d_calls = [tc for tc in multi_res["tool_calls"] if tc["name"] == "generate_2d_asset"]
-        assert len(two_d_calls) == 2
+        assert len(two_d_calls) == 3
         assert two_d_calls[0]["result"]["vram_swap_telemetry"]["step_d_restore"].get("deferred") is True
-        assert len(multi_res["vision_self_checks"]) >= 4
+        assert two_d_calls[1]["result"]["vram_swap_telemetry"]["step_d_restore"].get("deferred") is True
+
+        audio_calls = [tc for tc in multi_res["tool_calls"] if tc["name"] == "generate_game_audio"]
+        assert len(audio_calls) == 3
+        assert audio_calls[0]["result"]["vram_swap_lifecycle"]["step_d_restore"].get("deferred") is True
+
+        # Verify all Nebula Breaker 2D, 3D, Audio, Scene, and GDScript files exist and pass validation
+        ws = base / "workspace"
+        expected_files = [
+            ws / "project.godot",
+            ws / "assets" / "textures" / "arena_floor.png",
+            ws / "assets" / "textures" / "arena_floor_normal.png",
+            ws / "assets" / "textures" / "arena_floor_material.tres",
+            ws / "assets" / "textures" / "brick_albedo.png",
+            ws / "assets" / "ui" / "powerup_icon.png",
+            ws / "assets" / "models" / "paddle.glb",
+            ws / "assets" / "models" / "brick.glb",
+            ws / "assets" / "models" / "arena_frame.glb",
+            ws / "assets" / "audio" / "sfx_paddle_hit.wav",
+            ws / "assets" / "audio" / "sfx_brick_break.wav",
+            ws / "assets" / "audio" / "bgm_synthwave.ogg",
+            ws / "assets" / "audio" / "bgm_synthwave.ogg.import",
+            ws / "assets" / "audio" / "bgm_synthwave_spectrogram.png",
+            ws / "scripts" / "paddle.gd",
+            ws / "scripts" / "ball.gd",
+            ws / "scripts" / "brick.gd",
+            ws / "scripts" / "powerup.gd",
+            ws / "scenes" / "hud.tscn",
+            ws / "scenes" / "main.tscn",
+        ]
+        for ef in expected_files:
+            assert ef.exists(), f"Missing expected Nebula Breaker file: {ef}"
+
+        # Verify final validation tool call exited with 0 errors
+        cmd_calls = [tc for tc in multi_res["tool_calls"] if tc["name"] == "run_command"]
+        assert cmd_calls[-1]["result"]["valid"] is True
+        assert cmd_calls[-1]["result"]["exit_code"] == 0
 
     run_coro_sync(_run())
 

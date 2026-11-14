@@ -17,7 +17,7 @@ import traceback
 
 OUTPUT_GLB_PATH = "D:\\CodingProjects\\CustomHarness\\workspace\\assets\\models\\paddle.glb"
 OUTPUT_BLEND_PATH = "D:\\CodingProjects\\CustomHarness\\workspace\\assets\\models\\blend_src\\paddle.blend"
-CONTACT_SHEET_DIR = "C:\\Users\\abejh\\AppData\\Local\\Temp\\godot_blender_harness_dvg4du4i"
+CONTACT_SHEET_DIR = "C:\\Users\\abejh\\AppData\\Local\\Temp\\godot_blender_harness_74q90r17"
 RENDER_PREVIEW = True
 HEAVY_CYCLES_BAKE = False
 
@@ -31,15 +31,33 @@ scene.unit_settings.length_unit = 'METERS'
 # 2. Execute Agent Procedural bpy Script
 # ==================== BEGIN AGENT SCRIPT ====================
 import bpy
-bpy.ops.mesh.primitive_cube_add(size=1.2, location=(0, 0, 0.6))
-main_obj = bpy.context.active_object
-main_obj.name = 'Paddle'
-bev = main_obj.modifiers.new(name='Bevel', type='BEVEL')
+# Beveled sci-fi energy paddle body
+bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0.25))
+paddle = bpy.context.active_object
+paddle.name = 'PaddleBody'
+paddle.scale = (2.8, 0.55, 0.42)
+bev = paddle.modifiers.new(name='Bevel', type='BEVEL')
 bev.width = 0.08
-bev.segments = 2
-bpy.ops.mesh.primitive_cube_add(size=1.22, location=(0, 0, 0.6))
-col_obj = bpy.context.active_object
-col_obj.name = 'Paddle-col'
+bev.segments = 3
+mat_body = bpy.data.materials.new(name='PaddleEnergyMat')
+mat_body.use_nodes = True
+bsdf = mat_body.node_tree.nodes.get('Principled BSDF')
+if bsdf:
+    bsdf.inputs['Base Color'].default_value = (0.12, 0.72, 0.98, 1.0)
+    bsdf.inputs['Metallic'].default_value = 0.85
+    bsdf.inputs['Roughness'].default_value = 0.22
+paddle.data.materials.append(mat_body)
+# Glowing side thrusters
+for side, x_pos in (('L', -1.55), ('R', 1.55)):
+    bpy.ops.mesh.primitive_cylinder_add(radius=0.24, depth=0.65, location=(x_pos, 0, 0.25))
+    thr = bpy.context.active_object
+    thr.name = f'PaddleThruster_{side}'
+    thr.data.materials.append(mat_body)
+# Clean -col collision mesh
+bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0.25))
+col = bpy.context.active_object
+col.name = 'Paddle-col'
+col.scale = (3.3, 0.65, 0.45)
 
 # ===================== END AGENT SCRIPT =====================
 

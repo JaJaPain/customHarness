@@ -57,6 +57,10 @@
         🎮 Yield VRAM
       </button>
 
+      <button id="btn-folder-modal" class="toolbar-btn" title="Choose or Switch Active Godot 4 Project Folder">
+        📁 Project Folder
+      </button>
+
       <button id="btn-setup-modal" class="toolbar-btn toolbar-btn-accent" title="First-Run CUDA Binaries & GGUF Health Check">
         ⚙ Setup &amp; Health
       </button>
@@ -78,7 +82,13 @@
     <aside class="pane pane-left">
       <div class="pane-header">
         <span>GODOT 4 WORKSPACE (res://)</span>
-        <button id="btn-refresh-tree" class="icon-btn" title="Refresh Workspace Tree">↻</button>
+        <div style="display:flex; gap:4px; align-items:center;">
+          <button id="btn-change-folder-inline" class="mini-btn" title="Choose Godot 4 Project Folder">📁 Folder</button>
+          <button id="btn-refresh-tree" class="icon-btn" title="Refresh Workspace Tree">↻</button>
+        </div>
+      </div>
+      <div id="active-workspace-path-bar" style="padding:5px 10px; background:#0b1120; border-bottom:1px solid #1e293b; font-family:var(--font-mono); font-size:10.5px; color:#38bdf8; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="Active Project Folder">
+        ./workspace
       </div>
       <div id="file-tree" class="file-tree"></div>
 
@@ -298,6 +308,19 @@ col.name = "ArmoredCrate-colonly"</textarea>
       </div>
     </aside>
   </main>
+
+  <!-- Project Folder Picker Modal -->
+  <div id="folder-modal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>📁 Select or Create Godot 4 Project Folder</h3>
+        <button id="btn-close-folder-modal" class="icon-btn">✕</button>
+      </div>
+      <div id="folder-modal-body" class="modal-body">
+        Loading folders...
+      </div>
+    </div>
+  </div>
 
   <!-- First-Run Setup & Health Check Modal -->
   <div id="setup-modal" class="modal-backdrop hidden">

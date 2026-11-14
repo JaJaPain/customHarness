@@ -1,0 +1,117 @@
+[gd_scene load_steps=16 format=3 uid="uid://nebula_main_3d"]
+
+[ext_resource type="Material" path="res://assets/textures/arena_floor_material.tres" id="1_floor_mat"]
+[ext_resource type="PackedScene" path="res://assets/models/paddle.glb" id="2_paddle_glb"]
+[ext_resource type="PackedScene" path="res://assets/models/brick.glb" id="3_brick_glb"]
+[ext_resource type="PackedScene" path="res://assets/models/arena_frame.glb" id="4_frame_glb"]
+[ext_resource type="AudioStream" path="res://assets/audio/sfx_paddle_hit.wav" id="5_sfx_paddle"]
+[ext_resource type="AudioStream" path="res://assets/audio/sfx_brick_break.wav" id="6_sfx_brick"]
+[ext_resource type="AudioStream" path="res://assets/audio/bgm_synthwave.ogg" id="7_bgm"]
+[ext_resource type="Script" path="res://scripts/paddle.gd" id="8_paddle_gd"]
+[ext_resource type="Script" path="res://scripts/ball.gd" id="9_ball_gd"]
+[ext_resource type="Script" path="res://scripts/brick.gd" id="10_brick_gd"]
+[ext_resource type="PackedScene" path="res://scenes/hud.tscn" id="11_hud"]
+
+[sub_resource type="Environment" id="Environment_nebula"]
+background_mode = 1
+background_color = Color(0.03, 0.04, 0.09, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.22, 0.34, 0.55, 1)
+ambient_light_energy = 0.85
+tonemap_mode = 2
+glow_enabled = true
+glow_intensity = 0.9
+glow_bloom = 0.25
+
+[sub_resource type="PlaneMesh" id="PlaneMesh_floor"]
+size = Vector2(22, 22)
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_paddle"]
+size = Vector3(3.0, 0.6, 0.6)
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_ball"]
+radius = 0.32
+
+[sub_resource type="SphereMesh" id="SphereMesh_ball"]
+radius = 0.32
+height = 0.64
+
+[node name="NebulaBreakerMain" type="Node3D"]
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_nebula")
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.866025, -0.383022, 0.321394, 0, 0.642788, 0.766044, -0.5, -0.663414, 0.55667, 0, 14, 8)
+light_energy = 1.6
+shadow_enabled = true
+
+[node name="Camera3D" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.422618, 0.906308, 0, -0.906308, 0.422618, 0, 16.5, 9.2)
+current = true
+fov = 60.0
+
+[node name="ArenaFloor" type="MeshInstance3D" parent="."]
+mesh = SubResource("PlaneMesh_floor")
+surface_material_override/0 = ExtResource("1_floor_mat")
+
+[node name="ArenaBorderFrame" type="StaticBody3D" parent="."]
+
+[node name="ArenaFrameModel" parent="ArenaBorderFrame" instance=ExtResource("4_frame_glb")]
+
+[node name="Paddle" type="CharacterBody3D" parent="." groups=["paddle"]]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.3, 8.5)
+script = ExtResource("8_paddle_gd")
+
+[node name="PaddleCollider" type="CollisionShape3D" parent="Paddle"]
+shape = SubResource("BoxShape3D_paddle")
+
+[node name="PaddleMesh" parent="Paddle" instance=ExtResource("2_paddle_glb")]
+
+[node name="Ball" type="CharacterBody3D" parent="." groups=["balls"]]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.35, 7.4)
+script = ExtResource("9_ball_gd")
+
+[node name="BallCollider" type="CollisionShape3D" parent="Ball"]
+shape = SubResource("SphereShape3D_ball")
+
+[node name="BallMesh" type="MeshInstance3D" parent="Ball"]
+mesh = SubResource("SphereMesh_ball")
+
+[node name="BrickGrid" type="Node3D" parent="."]
+
+[node name="BrickStandard_1" type="StaticBody3D" parent="BrickGrid" groups=["bricks"]]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.0, 0.35, -4.5)
+script = ExtResource("10_brick_gd")
+brick_tier = 1
+
+[node name="BrickModel1" parent="BrickGrid/BrickStandard_1" instance=ExtResource("3_brick_glb")]
+
+[node name="BrickArmored_2" type="StaticBody3D" parent="BrickGrid" groups=["bricks"]]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.0, 0.35, -4.5)
+script = ExtResource("10_brick_gd")
+brick_tier = 2
+hit_points = 2
+
+[node name="BrickModel2" parent="BrickGrid/BrickArmored_2" instance=ExtResource("3_brick_glb")]
+
+[node name="BrickExplosive_3" type="StaticBody3D" parent="BrickGrid" groups=["bricks"]]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.0, 0.35, -4.5)
+script = ExtResource("10_brick_gd")
+brick_tier = 3
+
+[node name="BrickModel3" parent="BrickGrid/BrickExplosive_3" instance=ExtResource("3_brick_glb")]
+
+[node name="AudioPlayers" type="Node" parent="."]
+
+[node name="SfxPaddleHit" type="AudioStreamPlayer3D" parent="AudioPlayers"]
+stream = ExtResource("5_sfx_paddle")
+
+[node name="SfxBrickBreak" type="AudioStreamPlayer3D" parent="AudioPlayers"]
+stream = ExtResource("6_sfx_brick")
+
+[node name="BgmSynthwave" type="AudioStreamPlayer" parent="AudioPlayers"]
+stream = ExtResource("7_bgm")
+autoplay = true
+
+[node name="HUD" parent="." instance=ExtResource("11_hud")]

@@ -1,0 +1,35 @@
+[gd_scene load_steps=2 format=3 uid="uid://nebula_hud_scene"]
+
+[ext_resource type="Texture2D" path="res://assets/ui/powerup_icon.png" id="1_icon"]
+
+[node name="HUD" type="CanvasLayer"]
+
+[node name="TopBar" type="HBoxContainer" parent="."]
+offset_left = 24.0
+offset_top = 16.0
+offset_right = 1256.0
+offset_bottom = 64.0
+
+[node name="PowerUpIcon" type="TextureRect" parent="TopBar"]
+custom_minimum_size = Vector2(36, 36)
+texture = ExtResource("1_icon")
+expand_mode = 1
+
+[node name="ScoreLabel" type="Label" parent="TopBar"]
+text = "SCORE: 0000"
+
+[node name="LivesLabel" type="Label" parent="TopBar"]
+text = "   LIVES: 3"
+
+[node name="LevelLabel" type="Label" parent="TopBar"]
+text = "   LEVEL: 1"
+
+[node name="ComboLabel" type="Label" parent="TopBar"]
+text = "   COMBO: 1x"
+
+[node name="OverlayMessage" type="Label" parent="."]
+offset_left = 340.0
+offset_top = 320.0
+offset_right = 940.0
+offset_bottom = 400.0
+text = "NEBULA BREAKER 3D — PRESS SPACE / CLICK TO LAUNCH"

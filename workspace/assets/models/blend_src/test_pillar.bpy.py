@@ -17,7 +17,7 @@ import traceback
 
 OUTPUT_GLB_PATH = "D:\\CodingProjects\\CustomHarness\\workspace\\assets\\models\\test_pillar.glb"
 OUTPUT_BLEND_PATH = "D:\\CodingProjects\\CustomHarness\\workspace\\assets\\models\\blend_src\\test_pillar.blend"
-CONTACT_SHEET_DIR = "C:\\Users\\abejh\\AppData\\Local\\Temp\\godot_blender_harness_sus9vjhj"
+CONTACT_SHEET_DIR = "C:\\Users\\abejh\\AppData\\Local\\Temp\\godot_blender_harness_wev6j5ep"
 RENDER_PREVIEW = True
 HEAVY_CYCLES_BAKE = False
 

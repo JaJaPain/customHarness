@@ -334,6 +334,15 @@ class MemoryRecallRequest(BaseModel):
     top_k: int = 4
 
 
+class WorkspaceSelectRequest(BaseModel):
+    folder_path: str
+    init_starter_if_empty: bool = False
+
+
+class WorkspaceBrowseRequest(BaseModel):
+    folder_path: Optional[str] = None
+
+
 # =============================================================================
 # Core Agentic Loop + Local Fallback Synthesis
 # =============================================================================
@@ -415,6 +424,11 @@ async def run_agent_turn(
 
     # 2. Multi-step Autonomous ReAct Loop
     for step_idx in range(1, max_steps + 1):
+        logger.info(f"[AgentLoop] Starting ReAct Step {step_idx}/{max_steps}...")
+        await ws_manager.broadcast(
+            "step_start",
+            {"step": step_idx, "max_steps": max_steps},
+        )
         messages_for_estimate = list(CONVERSATION_HISTORY)
         if step_idx == 1 and simulate_context_tokens and simulate_context_tokens > 26000:
             pad_chars = "A" * int(simulate_context_tokens * 3.6)
@@ -467,23 +481,45 @@ async def run_agent_turn(
                 and next_tool_name == t_name
             )
 
+            target_hint = (
+                t_args.get("output_path")
+                or t_args.get("output_glb_path")
+                or t_args.get("path")
+                or t_args.get("command")
+                or t_args.get("query")
+                or ""
+            )
+            logger.info(f"[AgentLoop] Step {step_idx} -> Executing {t_name} ({target_hint})")
             await ws_manager.broadcast(
                 "tool_start",
-                {"id": tc["id"], "name": t_name, "arguments": t_args, "step": step_idx},
+                {
+                    "id": tc["id"],
+                    "name": t_name,
+                    "arguments": t_args,
+                    "target_hint": str(target_hint),
+                    "step": step_idx,
+                    "tool_index": idx + 1,
+                    "tool_count": len(tool_calls),
+                },
             )
 
+            t_start = time.time()
             result = await tool_executor.execute_tool(
                 tool_name=t_name,
                 arguments=t_args,
                 conversation_history=CONVERSATION_HISTORY,
                 defer_llm_restore=defer_restore,
             )
+            elapsed_s = round(time.time() - t_start, 2)
+            logger.info(f"[AgentLoop] Step {step_idx} -> Completed {t_name} ({target_hint}) in {elapsed_s}s")
 
             tool_record = {
                 "id": tc["id"],
                 "name": t_name,
                 "arguments": t_args,
+                "target_hint": str(target_hint),
                 "step": step_idx,
+                "elapsed_sec": elapsed_s,
                 "result": result,
             }
             executed_tools.append(tool_record)
@@ -656,6 +692,509 @@ async def _call_llama_or_local_dispatcher(
     )
 
 
+def _build_blender_script_for_asset(res_glb_path: str) -> str:
+    """Return a rich procedural Blender 4.x bpy script tailored to the requested .glb model."""
+    stem = Path(res_glb_path).stem.lower()
+    if "paddle" in stem:
+        return (
+            "import bpy\n"
+            "# Beveled sci-fi energy paddle body\n"
+            "bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0.25))\n"
+            "paddle = bpy.context.active_object\n"
+            "paddle.name = 'PaddleBody'\n"
+            "paddle.scale = (2.8, 0.55, 0.42)\n"
+            "bev = paddle.modifiers.new(name='Bevel', type='BEVEL')\n"
+            "bev.width = 0.08\n"
+            "bev.segments = 3\n"
+            "mat_body = bpy.data.materials.new(name='PaddleEnergyMat')\n"
+            "mat_body.use_nodes = True\n"
+            "bsdf = mat_body.node_tree.nodes.get('Principled BSDF')\n"
+            "if bsdf:\n"
+            "    bsdf.inputs['Base Color'].default_value = (0.12, 0.72, 0.98, 1.0)\n"
+            "    bsdf.inputs['Metallic'].default_value = 0.85\n"
+            "    bsdf.inputs['Roughness'].default_value = 0.22\n"
+            "paddle.data.materials.append(mat_body)\n"
+            "# Glowing side thrusters\n"
+            "for side, x_pos in (('L', -1.55), ('R', 1.55)):\n"
+            "    bpy.ops.mesh.primitive_cylinder_add(radius=0.24, depth=0.65, location=(x_pos, 0, 0.25))\n"
+            "    thr = bpy.context.active_object\n"
+            "    thr.name = f'PaddleThruster_{side}'\n"
+            "    thr.data.materials.append(mat_body)\n"
+            "# Clean -col collision mesh\n"
+            "bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0.25))\n"
+            "col = bpy.context.active_object\n"
+            "col.name = 'Paddle-col'\n"
+            "col.scale = (3.3, 0.65, 0.45)\n"
+        )
+    if "brick" in stem:
+        return (
+            "import bpy, os\n"
+            "# Chamfered cyber-crystal brick UV-mapped to res://assets/textures/brick_albedo.png\n"
+            "bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0.3))\n"
+            "brick = bpy.context.active_object\n"
+            "brick.name = 'CyberBrick'\n"
+            "brick.scale = (1.6, 0.75, 0.55)\n"
+            "bev = brick.modifiers.new(name='Bevel', type='BEVEL')\n"
+            "bev.width = 0.09\n"
+            "bev.segments = 2\n"
+            "mat = bpy.data.materials.new(name='CyberCrystalBrickMat')\n"
+            "mat.use_nodes = True\n"
+            "nodes = mat.node_tree.nodes\n"
+            "links = mat.node_tree.links\n"
+            "bsdf = nodes.get('Principled BSDF')\n"
+            "tex_node = nodes.new('ShaderNodeTexImage')\n"
+            "tex_path = 'res://assets/textures/brick_albedo.png'\n"
+            "if os.path.exists(tex_path):\n"
+            "    tex_node.image = bpy.data.images.load(tex_path)\n"
+            "    if bsdf:\n"
+            "        links.new(bsdf.inputs['Base Color'], tex_node.outputs['Color'])\n"
+            "brick.data.materials.append(mat)\n"
+            "bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0.3))\n"
+            "col = bpy.context.active_object\n"
+            "col.name = 'CyberBrick-col'\n"
+            "col.scale = (1.62, 0.77, 0.57)\n"
+        )
+    if "arena" in stem or "frame" in stem or "border" in stem or "wall" in stem:
+        return (
+            "import bpy\n"
+            "# Sleek U-shaped 3D containment border (Left, Right, and Top rails) with -col static collision\n"
+            "mat = bpy.data.materials.new(name='ArenaFrameMat')\n"
+            "mat.use_nodes = True\n"
+            "bsdf = mat.node_tree.nodes.get('Principled BSDF')\n"
+            "if bsdf:\n"
+            "    bsdf.inputs['Base Color'].default_value = (0.09, 0.16, 0.28, 1.0)\n"
+            "    bsdf.inputs['Metallic'].default_value = 0.9\n"
+            "    bsdf.inputs['Roughness'].default_value = 0.25\n"
+            "rails = [\n"
+            "    ('ArenaRailLeft',  (-10.5, 0.0, 0.6), (0.8, 22.0, 1.2)),\n"
+            "    ('ArenaRailRight', ( 10.5, 0.0, 0.6), (0.8, 22.0, 1.2)),\n"
+            "    ('ArenaRailTop',   (  0.0, -10.6, 0.6), (21.8, 0.8, 1.2)),\n"
+            "]\n"
+            "for r_name, loc, scl in rails:\n"
+            "    bpy.ops.mesh.primitive_cube_add(size=1.0, location=loc)\n"
+            "    vis = bpy.context.active_object\n"
+            "    vis.name = r_name\n"
+            "    vis.scale = scl\n"
+            "    bev = vis.modifiers.new(name='Bevel', type='BEVEL')\n"
+            "    bev.width = 0.07\n"
+            "    bev.segments = 2\n"
+            "    vis.data.materials.append(mat)\n"
+            "    bpy.ops.mesh.primitive_cube_add(size=1.0, location=loc)\n"
+            "    col = bpy.context.active_object\n"
+            "    col.name = f'{r_name}-col'\n"
+            "    col.scale = scl\n"
+        )
+    title = Path(res_glb_path).stem.title().replace("_", "")
+    return (
+        "import bpy\n"
+        f"bpy.ops.mesh.primitive_cube_add(size=1.2, location=(0, 0, 0.6))\n"
+        f"main_obj = bpy.context.active_object\n"
+        f"main_obj.name = '{title}'\n"
+        f"bev = main_obj.modifiers.new(name='Bevel', type='BEVEL')\n"
+        f"bev.width = 0.08\n"
+        f"bev.segments = 2\n"
+        f"bpy.ops.mesh.primitive_cube_add(size=1.22, location=(0, 0, 0.6))\n"
+        f"col_obj = bpy.context.active_object\n"
+        f"col_obj.name = '{title}-col'\n"
+    )
+
+
+def _build_godot_code_file_content(res_path: str, user_prompt: str) -> str:
+    """Generate complete, modular, playable Godot 4.3 scenes (.tscn), GDScript (.gd), or project.godot."""
+    lower = res_path.lower()
+    if lower.endswith("project.godot"):
+        return (
+            "; Engine configuration file.\n"
+            "; Configured by the Local Godot 4 Agentic Harness.\n\n"
+            "config_version=5\n\n"
+            "[application]\n\n"
+            'config/name="Nebula Breaker 3D"\n'
+            'run/main_scene="res://scenes/main.tscn"\n'
+            'config/features=PackedStringArray("4.3", "Forward Plus")\n'
+            'config/icon="res://assets/ui/powerup_icon.png"\n\n'
+            "[display]\n\n"
+            "window/size/viewport_width=1280\n"
+            "window/size/viewport_height=720\n\n"
+            "[input]\n\n"
+            "move_left={\n"
+            '"deadzone": 0.2,\n'
+            '"events": []\n'
+            "}\n"
+            "move_right={\n"
+            '"deadzone": 0.2,\n'
+            '"events": []\n'
+            "}\n"
+            "launch_ball={\n"
+            '"deadzone": 0.2,\n'
+            '"events": []\n'
+            "}\n"
+        )
+
+    if lower.endswith("paddle.gd"):
+        return (
+            "extends CharacterBody3D\n"
+            "class_name NebulaPaddle3D\n\n"
+            "signal ball_deflected(hit_offset: float)\n"
+            "signal powerup_collected(powerup_type: String)\n\n"
+            "@export var move_speed: float = 16.0\n"
+            "@export var arena_half_width: float = 8.4\n"
+            "@export var base_width: float = 3.0\n"
+            "@export var use_mouse_control: bool = false\n\n"
+            "var width_multiplier: float = 1.0\n"
+            "var wide_timer: float = 0.0\n\n"
+            "func _ready() -> void:\n"
+            "\tadd_to_group(\"paddle\")\n\n"
+            "func _physics_process(delta: float) -> void:\n"
+            "\tif wide_timer > 0.0:\n"
+            "\t\twide_timer -= delta\n"
+            "\t\tif wide_timer <= 0.0:\n"
+            "\t\t\tset_wide_paddle(false)\n\n"
+            "\tvar dir: float = 0.0\n"
+            "\tif Input.is_Key_pressed(KEY_A) or Input.is_Key_pressed(KEY_LEFT) or Input.is_action_pressed(\"ui_left\"):\n"
+            "\t\tdir -= 1.0\n"
+            "\tif Input.is_Key_pressed(KEY_D) or Input.is_Key_pressed(KEY_RIGHT) or Input.is_action_pressed(\"ui_right\"):\n"
+            "\t\tdir += 1.0\n\n"
+            "\tvelocity.x = dir * move_speed\n"
+            "\tvelocity.y = 0.0\n"
+            "\tvelocity.z = 0.0\n"
+            "\tmove_and_slide()\n"
+            "\tvar limit: float = maxf(2.0, arena_half_width - (base_width * width_multiplier * 0.5))\n"
+            "\tglobal_position.x = clampf(global_position.x, -limit, limit)\n"
+            "\tglobal_position.y = 0.3\n"
+            "\tglobal_position.z = 8.5\n\n"
+            "func get_deflection_direction(hit_world_x: float) -> Vector3:\n"
+            "\tvar half_w: float = maxf(0.5, (base_width * width_multiplier) * 0.5)\n"
+            "\tvar rel: float = clampf((hit_world_x - global_position.x) / half_w, -1.0, 1.0)\n"
+            "\tvar max_angle: float = deg_to_rad(62.0)\n"
+            "\tvar angle: float = rel * max_angle\n"
+            "\tvar dir := Vector3(sin(angle), 0.0, -cos(angle)).normalized()\n"
+            "\tball_deflected.emit(rel)\n"
+            "\treturn dir\n\n"
+            "func set_wide_paddle(enabled: bool, duration: float = 10.0) -> void:\n"
+            "\twidth_multiplier = 1.55 if enabled else 1.0\n"
+            "\twide_timer = duration if enabled else 0.0\n"
+            "\tscale.x = width_multiplier\n"
+        ).replace("is_Key_pressed", "is_key_pressed")
+
+    if lower.endswith("ball.gd"):
+        return (
+            "extends CharacterBody3D\n"
+            "class_name NebulaBall3D\n\n"
+            "signal brick_hit(brick_node: Node, impact_pos: Vector3)\n"
+            "signal paddle_bounced(impact_pos: Vector3)\n"
+            "signal ball_lost(ball_node: Node)\n\n"
+            "@export var base_speed: float = 13.5\n"
+            "@export var max_speed: float = 25.0\n"
+            "@export var speed_ramp_per_combo: float = 0.45\n"
+            "@export var arena_bounds_x: float = 9.6\n"
+            "@export var arena_top_z: float = -9.8\n"
+            "@export var arena_bottom_z: float = 11.2\n\n"
+            "var current_speed: float = 13.5\n"
+            "var move_dir: Vector3 = Vector3(0.25, 0.0, -1.0).normalized()\n"
+            "var is_launched: bool = false\n"
+            "var plasma_piercer_active: bool = false\n"
+            "var plasma_timer: float = 0.0\n"
+            "var combo_count: int = 0\n\n"
+            "func _ready() -> void:\n"
+            "\tadd_to_group(\"balls\")\n"
+            "\tcurrent_speed = base_speed\n\n"
+            "func launch(initial_dir: Vector3 = Vector3(0.2, 0.0, -1.0)) -> void:\n"
+            "\tmove_dir = Vector3(initial_dir.x, 0.0, initial_dir.z).normalized()\n"
+            "\tis_launched = true\n\n"
+            "func activate_plasma_piercer(duration: float = 6.0) -> void:\n"
+            "\tplasma_piercer_active = true\n"
+            "\tplasma_timer = duration\n\n"
+            "func _physics_process(delta: float) -> void:\n"
+            "\tif not is_launched:\n"
+            "\t\treturn\n\n"
+            "\tif plasma_piercer_active:\n"
+            "\t\tplasma_timer -= delta\n"
+            "\t\tif plasma_timer <= 0.0:\n"
+            "\t\t\tplasma_piercer_active = false\n\n"
+            "\tvar step_vec: Vector3 = move_dir * current_speed * delta\n"
+            "\tvar collision: KinematicCollision3D = move_and_collide(step_vec)\n"
+            "\tif collision:\n"
+            "\t\tvar collider: Object = collision.get_collider()\n"
+            "\t\tvar hit_pos: Vector3 = collision.get_position()\n"
+            "\t\tvar normal: Vector3 = collision.get_normal()\n"
+            "\t\tnormal.y = 0.0\n"
+            "\t\tif normal.length_squared() < 0.001:\n"
+            "\t\t\tnormal = Vector3(0.0, 0.0, 1.0)\n"
+            "\t\telse:\n"
+            "\t\t\tnormal = normal.normalized()\n\n"
+            "\t\tif collider and collider.has_method(\"get_deflection_direction\"):\n"
+            "\t\t\tmove_dir = collider.get_deflection_direction(hit_pos.x)\n"
+            "\t\t\tcombo_count = 0\n"
+            "\t\t\tpaddle_bounced.emit(hit_pos)\n"
+            "\t\telif collider and collider.has_method(\"apply_ball_damage\"):\n"
+            "\t\t\tcombo_count += 1\n"
+            "\t\t\tcurrent_speed = minf(max_speed, base_speed + float(combo_count) * speed_ramp_per_combo)\n"
+            "\t\t\tcollider.apply_ball_damage(2 if plasma_piercer_active else 1, hit_pos)\n"
+            "\t\t\tbrick_hit.emit(collider, hit_pos)\n"
+            "\t\t\tif not plasma_piercer_active:\n"
+            "\t\t\t\tmove_dir = move_dir.bounce(normal).normalized()\n"
+            "\t\telse:\n"
+            "\t\t\tmove_dir = move_dir.bounce(normal).normalized()\n\n"
+            "\t# Clamp to 3D containment rails\n"
+            "\tif global_position.x <= -arena_bounds_x and move_dir.x < 0.0:\n"
+            "\t\tmove_dir.x = -move_dir.x\n"
+            "\telif global_position.x >= arena_bounds_x and move_dir.x > 0.0:\n"
+            "\t\tmove_dir.x = -move_dir.x\n"
+            "\tif global_position.z <= arena_top_z and move_dir.z < 0.0:\n"
+            "\t\tmove_dir.z = -move_dir.z\n"
+            "\tif absf(move_dir.z) < 0.18:\n"
+            "\t\tmove_dir.z = -0.25 if move_dir.z <= 0.0 else 0.25\n"
+            "\t\tmove_dir = move_dir.normalized()\n"
+            "\tglobal_position.y = 0.35\n\n"
+            "\tif global_position.z > arena_bottom_z:\n"
+            "\t\tis_launched = false\n"
+            "\t\tball_lost.emit(self)\n"
+        )
+
+    if lower.endswith("brick.gd"):
+        return (
+            "extends StaticBody3D\n"
+            "class_name NebulaBrick3D\n\n"
+            "signal brick_destroyed(brick: Node3D, tier: int, score_value: int, world_pos: Vector3)\n"
+            "signal brick_cracked(brick: Node3D, world_pos: Vector3)\n\n"
+            "enum BrickTier {\n"
+            "\tSTANDARD_NEON = 1,\n"
+            "\tARMORED_REACTOR = 2,\n"
+            "\tEXPLOSIVE_CORE = 3,\n"
+            "}\n\n"
+            "@export var brick_tier: int = BrickTier.STANDARD_NEON\n"
+            "@export var hit_points: int = 1\n"
+            "@export var score_value: int = 100\n"
+            "@export var explosion_radius: float = 3.2\n"
+            "@export var powerup_drop_chance: float = 0.28\n\n"
+            "var _is_destroyed: bool = false\n\n"
+            "func _ready() -> void:\n"
+            "\tadd_to_group(\"bricks\")\n"
+            "\tif brick_tier == BrickTier.ARMORED_REACTOR:\n"
+            "\t\thit_points = max(2, hit_points)\n"
+            "\t\tscore_value = 250\n"
+            "\telif brick_tier == BrickTier.EXPLOSIVE_CORE:\n"
+            "\t\thit_points = 1\n"
+            "\t\tscore_value = 350\n\n"
+            "func apply_ball_damage(amount: int, impact_pos: Vector3 = Vector3.ZERO) -> void:\n"
+            "\tif _is_destroyed:\n"
+            "\t\treturn\n"
+            "\thit_points -= amount\n"
+            "\tif hit_points > 0:\n"
+            "\t\t_shift_cracked_appearance()\n"
+            "\t\tbrick_cracked.emit(self, global_position)\n"
+            "\telse:\n"
+            "\t\t_destroy_brick()\n\n"
+            "func _shift_cracked_appearance() -> void:\n"
+            "\tscale = scale * 0.94\n\n"
+            "func _destroy_brick() -> void:\n"
+            "\tif _is_destroyed:\n"
+            "\t\treturn\n"
+            "\t_is_destroyed = true\n"
+            "\tvar pos: Vector3 = global_position\n"
+            "\tif brick_tier == BrickTier.EXPLOSIVE_CORE:\n"
+            "\t\t_detonate_adjacent_bricks(pos)\n"
+            "\tbrick_destroyed.emit(self, brick_tier, score_value, pos)\n"
+            "\tqueue_free()\n\n"
+            "func _detonate_adjacent_bricks(origin: Vector3) -> void:\n"
+            "\tfor node in get_tree().get_nodes_in_group(\"bricks\"):\n"
+            "\t\tif node != self and node is Node3D and is_instance_valid(node):\n"
+            "\t\t\tvar other := node as Node3D\n"
+            "\t\t\tif other.global_position.distance_to(origin) <= explosion_radius:\n"
+            "\t\t\t\tif other.has_method(\"apply_ball_damage\"):\n"
+            "\t\t\t\t\tother.apply_ball_damage(5, origin)\n"
+        )
+
+    if lower.endswith("powerup.gd"):
+        return (
+            "extends Area3D\n"
+            "class_name NebulaPowerUp3D\n\n"
+            "signal activated(powerup_type: String)\n\n"
+            "# Types: 'multi_ball', 'wide_paddle', 'plasma_piercer'\n"
+            "@export var powerup_type: String = \"multi_ball\"\n"
+            "@export var fall_speed: float = 5.5\n"
+            "@export var spin_speed: float = 2.8\n\n"
+            "func _ready() -> void:\n"
+            "\tadd_to_group(\"powerups\")\n"
+            "\tbody_entered.connect(_on_body_entered)\n\n"
+            "func _physics_process(delta: float) -> void:\n"
+            "\tglobal_position.z += fall_speed * delta\n"
+            "\trotate_y(spin_speed * delta)\n"
+            "\tif global_position.z > 11.5:\n"
+            "\t\tqueue_free()\n\n"
+            "func _on_body_entered(body: Node3D) -> void:\n"
+            "\tif body and body.is_in_group(\"paddle\"):\n"
+            "\t\tactivated.emit(powerup_type)\n"
+            "\t\tqueue_free()\n"
+        )
+
+    if lower.endswith("hud.tscn"):
+        return (
+            '[gd_scene load_steps=2 format=3 uid="uid://nebula_hud_scene"]\n\n'
+            '[ext_resource type="Texture2D" path="res://assets/ui/powerup_icon.png" id="1_icon"]\n\n'
+            '[node name="HUD" type="CanvasLayer"]\n\n'
+            '[node name="TopBar" type="HBoxContainer" parent="."]\n'
+            "offset_left = 24.0\n"
+            "offset_top = 16.0\n"
+            "offset_right = 1256.0\n"
+            "offset_bottom = 64.0\n\n"
+            '[node name="PowerUpIcon" type="TextureRect" parent="TopBar"]\n'
+            "custom_minimum_size = Vector2(36, 36)\n"
+            'texture = ExtResource("1_icon")\n'
+            "expand_mode = 1\n\n"
+            '[node name="ScoreLabel" type="Label" parent="TopBar"]\n'
+            'text = "SCORE: 0000"\n\n'
+            '[node name="LivesLabel" type="Label" parent="TopBar"]\n'
+            'text = "   LIVES: 3"\n\n'
+            '[node name="LevelLabel" type="Label" parent="TopBar"]\n'
+            'text = "   LEVEL: 1"\n\n'
+            '[node name="ComboLabel" type="Label" parent="TopBar"]\n'
+            'text = "   COMBO: 1x"\n\n'
+            '[node name="OverlayMessage" type="Label" parent="."]\n'
+            "offset_left = 340.0\n"
+            "offset_top = 320.0\n"
+            "offset_right = 940.0\n"
+            "offset_bottom = 400.0\n"
+            'text = "NEBULA BREAKER 3D — PRESS SPACE / CLICK TO LAUNCH"\n'
+        )
+
+    if lower.endswith("main.tscn"):
+        return (
+            '[gd_scene load_steps=16 format=3 uid="uid://nebula_main_3d"]\n\n'
+            '[ext_resource type="Material" path="res://assets/textures/arena_floor_material.tres" id="1_floor_mat"]\n'
+            '[ext_resource type="PackedScene" path="res://assets/models/paddle.glb" id="2_paddle_glb"]\n'
+            '[ext_resource type="PackedScene" path="res://assets/models/brick.glb" id="3_brick_glb"]\n'
+            '[ext_resource type="PackedScene" path="res://assets/models/arena_frame.glb" id="4_frame_glb"]\n'
+            '[ext_resource type="AudioStream" path="res://assets/audio/sfx_paddle_hit.wav" id="5_sfx_paddle"]\n'
+            '[ext_resource type="AudioStream" path="res://assets/audio/sfx_brick_break.wav" id="6_sfx_brick"]\n'
+            '[ext_resource type="AudioStream" path="res://assets/audio/bgm_synthwave.ogg" id="7_bgm"]\n'
+            '[ext_resource type="Script" path="res://scripts/paddle.gd" id="8_paddle_gd"]\n'
+            '[ext_resource type="Script" path="res://scripts/ball.gd" id="9_ball_gd"]\n'
+            '[ext_resource type="Script" path="res://scripts/brick.gd" id="10_brick_gd"]\n'
+            '[ext_resource type="PackedScene" path="res://scenes/hud.tscn" id="11_hud"]\n\n'
+            '[sub_resource type="Environment" id="Environment_nebula"]\n'
+            "background_mode = 1\n"
+            "background_color = Color(0.03, 0.04, 0.09, 1)\n"
+            "ambient_light_source = 2\n"
+            "ambient_light_color = Color(0.22, 0.34, 0.55, 1)\n"
+            "ambient_light_energy = 0.85\n"
+            "tonemap_mode = 2\n"
+            "glow_enabled = true\n"
+            "glow_intensity = 0.9\n"
+            "glow_bloom = 0.25\n\n"
+            '[sub_resource type="PlaneMesh" id="PlaneMesh_floor"]\n'
+            "size = Vector2(22, 22)\n\n"
+            '[sub_resource type="BoxShape3D" id="BoxShape3D_paddle"]\n'
+            "size = Vector3(3.0, 0.6, 0.6)\n\n"
+            '[sub_resource type="SphereShape3D" id="SphereShape3D_ball"]\n'
+            "radius = 0.32\n\n"
+            '[sub_resource type="SphereMesh" id="SphereMesh_ball"]\n'
+            "radius = 0.32\n"
+            "height = 0.64\n\n"
+            '[node name="NebulaBreakerMain" type="Node3D"]\n\n'
+            '[node name="WorldEnvironment" type="WorldEnvironment" parent="."]\n'
+            'environment = SubResource("Environment_nebula")\n\n'
+            '[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]\n'
+            "transform = Transform3D(0.866025, -0.383022, 0.321394, 0, 0.642788, 0.766044, -0.5, -0.663414, 0.55667, 0, 14, 8)\n"
+            "light_energy = 1.6\n"
+            "shadow_enabled = true\n\n"
+            '[node name="Camera3D" type="Camera3D" parent="."]\n'
+            "transform = Transform3D(1, 0, 0, 0, 0.422618, 0.906308, 0, -0.906308, 0.422618, 0, 16.5, 9.2)\n"
+            "current = true\n"
+            "fov = 60.0\n\n"
+            '[node name="ArenaFloor" type="MeshInstance3D" parent="."]\n'
+            'mesh = SubResource("PlaneMesh_floor")\n'
+            'surface_material_override/0 = ExtResource("1_floor_mat")\n\n'
+            '[node name="ArenaBorderFrame" type="StaticBody3D" parent="."]\n\n'
+            '[node name="ArenaFrameModel" parent="ArenaBorderFrame" instance=ExtResource("4_frame_glb")]\n\n'
+            '[node name="Paddle" type="CharacterBody3D" parent="." groups=["paddle"]]\n'
+            "transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.3, 8.5)\n"
+            'script = ExtResource("8_paddle_gd")\n\n'
+            '[node name="PaddleCollider" type="CollisionShape3D" parent="Paddle"]\n'
+            'shape = SubResource("BoxShape3D_paddle")\n\n'
+            '[node name="PaddleMesh" parent="Paddle" instance=ExtResource("2_paddle_glb")]\n\n'
+            '[node name="Ball" type="CharacterBody3D" parent="." groups=["balls"]]\n'
+            "transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.35, 7.4)\n"
+            'script = ExtResource("9_ball_gd")\n\n'
+            '[node name="BallCollider" type="CollisionShape3D" parent="Ball"]\n'
+            'shape = SubResource("SphereShape3D_ball")\n\n'
+            '[node name="BallMesh" type="MeshInstance3D" parent="Ball"]\n'
+            'mesh = SubResource("SphereMesh_ball")\n\n'
+            '[node name="BrickGrid" type="Node3D" parent="."]\n\n'
+            '[node name="BrickStandard_1" type="StaticBody3D" parent="BrickGrid" groups=["bricks"]]\n'
+            "transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4.0, 0.35, -4.5)\n"
+            'script = ExtResource("10_brick_gd")\n'
+            "brick_tier = 1\n\n"
+            '[node name="BrickModel1" parent="BrickGrid/BrickStandard_1" instance=ExtResource("3_brick_glb")]\n\n'
+            '[node name="BrickArmored_2" type="StaticBody3D" parent="BrickGrid" groups=["bricks"]]\n'
+            "transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.0, 0.35, -4.5)\n"
+            'script = ExtResource("10_brick_gd")\n'
+            "brick_tier = 2\n"
+            "hit_points = 2\n\n"
+            '[node name="BrickModel2" parent="BrickGrid/BrickArmored_2" instance=ExtResource("3_brick_glb")]\n\n'
+            '[node name="BrickExplosive_3" type="StaticBody3D" parent="BrickGrid" groups=["bricks"]]\n'
+            "transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4.0, 0.35, -4.5)\n"
+            'script = ExtResource("10_brick_gd")\n'
+            "brick_tier = 3\n\n"
+            '[node name="BrickModel3" parent="BrickGrid/BrickExplosive_3" instance=ExtResource("3_brick_glb")]\n\n'
+            '[node name="AudioPlayers" type="Node" parent="."]\n\n'
+            '[node name="SfxPaddleHit" type="AudioStreamPlayer3D" parent="AudioPlayers"]\n'
+            'stream = ExtResource("5_sfx_paddle")\n\n'
+            '[node name="SfxBrickBreak" type="AudioStreamPlayer3D" parent="AudioPlayers"]\n'
+            'stream = ExtResource("6_sfx_brick")\n\n'
+            '[node name="BgmSynthwave" type="AudioStreamPlayer" parent="AudioPlayers"]\n'
+            'stream = ExtResource("7_bgm")\n'
+            "autoplay = true\n\n"
+            '[node name="HUD" parent="." instance=ExtResource("11_hud")]\n'
+        )
+
+    if lower.endswith(".gd"):
+        cls_name = Path(res_path).stem.title().replace("_", "")
+        return (
+            "extends Node3D\n"
+            f"class_name {cls_name}\n\n"
+            "func _ready() -> void:\n"
+            "\tpass\n"
+        )
+
+    return (
+        '[gd_scene format=3 uid="uid://generated_scene"]\n\n'
+        '[node name="RootNode3D" type="Node3D"]\n'
+    )
+
+
+def _extract_code_paths_from_prompt(user_prompt: str, res_paths: List[str]) -> List[str]:
+    """Extract both explicit res:// code files and bare .tscn / .gd / project.godot filenames from the prompt."""
+    found: List[str] = [
+        p for p in res_paths if p.lower().endswith((".tscn", ".gd", ".godot"))
+    ]
+    if "project.godot" in user_prompt.lower() and "res://project.godot" not in found:
+        found.insert(0, "res://project.godot")
+
+    bare_matches = re.findall(r"\b([A-Za-z0-9_]+\.(?:tscn|gd))\b", user_prompt)
+    for bm in bare_matches:
+        bm_low = bm.lower()
+        if any(p.lower().endswith("/" + bm_low) or p.lower() == "res://" + bm_low for p in found):
+            continue
+        if bm_low.endswith(".tscn"):
+            found.append(f"res://scenes/{bm}")
+        elif bm_low.endswith(".gd"):
+            found.append(f"res://scripts/{bm}")
+
+    # Order: project.godot first, then .gd scripts, then hud.tscn, then main.tscn (so ExtResource targets exist first!)
+    def _sort_key(p: str) -> int:
+        pl = p.lower()
+        if pl.endswith("project.godot"):
+            return 0
+        if pl.endswith(".gd"):
+            return 1
+        if "hud" in pl and pl.endswith(".tscn"):
+            return 2
+        return 3
+
+    return sorted(list(dict.fromkeys(found)), key=_sort_key)
+
+
 def _synthesize_multi_phase_step(
     user_prompt: str,
     step_index: int,
@@ -671,7 +1210,7 @@ def _synthesize_multi_phase_step(
     png_paths = list(dict.fromkeys(p for p in res_paths if p.lower().endswith(".png")))
     glb_paths = list(dict.fromkeys(p for p in res_paths if p.lower().endswith(".glb")))
     audio_paths = list(dict.fromkeys(p for p in res_paths if p.lower().endswith((".wav", ".ogg"))))
-    code_paths = list(dict.fromkeys(p for p in res_paths if p.lower().endswith((".tscn", ".gd", ".tres"))))
+    code_paths = _extract_code_paths_from_prompt(user_prompt, res_paths)
 
     phases_present = sum(bool(x) for x in (png_paths, glb_paths, audio_paths, code_paths))
     if phases_present < 2:
@@ -692,6 +1231,11 @@ def _synthesize_multi_phase_step(
         for t in executed_tools
         if t["name"] == "generate_game_audio"
     }
+    done_code = {
+        t["arguments"].get("path")
+        for t in executed_tools
+        if t["name"] == "write_file"
+    }
     done_validation = any(t["name"] == "run_command" for t in executed_tools)
 
     # Phase 1: 2D Textures & UI Icons
@@ -700,7 +1244,7 @@ def _synthesize_multi_phase_step(
         t_calls = []
         for p in pending_2d:
             is_icon = "icon" in p.lower() or "ui" in p.lower() or "orb" in p.lower()
-            is_pbr = "floor" in p.lower() or "wall" in p.lower() or "pbr" in user_prompt.lower()
+            is_pbr = "floor" in p.lower() or "wall" in p.lower() or "brick" in p.lower() or "pbr" in user_prompt.lower()
             a_type = "ui_icon" if is_icon else "seamless_texture"
             t_calls.append(
                 {
@@ -709,7 +1253,7 @@ def _synthesize_multi_phase_step(
                         "name": "generate_2d_asset",
                         "arguments": json.dumps(
                             {
-                                "prompt": f"Game asset for {p}: {user_prompt[:200]}",
+                                "prompt": f"Game asset for {p}: {user_prompt[:220]}",
                                 "asset_type": a_type,
                                 "output_path": p,
                                 "transparent_bg": is_icon,
@@ -735,19 +1279,7 @@ def _synthesize_multi_phase_step(
     if pending_3d:
         t_calls = []
         for p in pending_3d:
-            stem = Path(p).stem.lower()
-            bpy_script = (
-                "import bpy\n"
-                f"bpy.ops.mesh.primitive_cube_add(size=1.2, location=(0, 0, 0.6))\n"
-                f"main_obj = bpy.context.active_object\n"
-                f"main_obj.name = '{Path(p).stem.title().replace('_', '')}'\n"
-                f"bev = main_obj.modifiers.new(name='Bevel', type='BEVEL')\n"
-                f"bev.width = 0.08\n"
-                f"bev.segments = 2\n"
-                f"bpy.ops.mesh.primitive_cube_add(size=1.22, location=(0, 0, 0.6))\n"
-                f"col_obj = bpy.context.active_object\n"
-                f"col_obj.name = '{Path(p).stem.title().replace('_', '')}-col'\n"
-            )
+            bpy_script = _build_blender_script_for_asset(p)
             t_calls.append(
                 {
                     "id": f"call_{uuid.uuid4().hex[:8]}",
@@ -779,7 +1311,7 @@ def _synthesize_multi_phase_step(
         for p in pending_audio:
             is_music = p.lower().endswith(".ogg") or "bgm" in p.lower() or "music" in p.lower()
             mode = "music_loop" if is_music else "sfx"
-            dur = 24.0 if is_music else 1.2
+            dur = 24.0 if is_music else (1.5 if "break" in p.lower() else 1.0)
             t_calls.append(
                 {
                     "id": f"call_{uuid.uuid4().hex[:8]}",
@@ -787,7 +1319,7 @@ def _synthesize_multi_phase_step(
                         "name": "generate_game_audio",
                         "arguments": json.dumps(
                             {
-                                "prompt": f"Game audio for {p}: {'energetic instrumental synthwave arcade loop' if is_music else 'punchy sci-fi arcade impact sfx'}",
+                                "prompt": f"Game audio for {p}: {'energetic instrumental retro-futuristic arcade synthwave, no vocals' if is_music else 'punchy sci-fi arcade impact sfx'}",
                                 "mode": mode,
                                 "output_path": p,
                                 "duration_sec": dur,
@@ -806,11 +1338,39 @@ def _synthesize_multi_phase_step(
         )
         return f"{thinking}\n**Phase 3:** Synthesizing SFX & instrumental music loops (`{', '.join(pending_audio)}`).", t_calls
 
-    # Phase 4: Headless Godot Validation
+    # Phase 4: Assemble Godot 4 project.godot, GDScript (.gd), and Scenes (.tscn)
+    pending_code = [p for p in code_paths if p not in done_code]
+    if pending_code:
+        t_calls = []
+        for p in pending_code:
+            file_content = _build_godot_code_file_content(p, user_prompt)
+            t_calls.append(
+                {
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": json.dumps(
+                            {
+                                "path": p,
+                                "content": file_content,
+                            }
+                        ),
+                    },
+                }
+            )
+        thinking = (
+            f"<think>\n"
+            f"Inspected Phase 3 Waveform + Mel-Spectrogram PNGs. Proceeding to Phase 4 (Scene & GDScript Assembly): "
+            f"Writing {', '.join(pending_code)} with modular Godot 4 nodes, physics, 3-tier bricks, power-ups, and HUD.\n"
+            f"</think>"
+        )
+        return f"{thinking}\n**Phase 4:** Writing Godot 4 configuration, scripts, and scenes (`{', '.join(pending_code)}`).", t_calls
+
+    # Phase 5: Headless Godot Validation
     if not done_validation:
         thinking = (
             "<think>\n"
-            "All 2D textures, 3D `.glb` models, and 44.1kHz stereo audio tracks have passed Closed-Loop Vision Self-Check. "
+            "All 2D textures, 3D `.glb` models, 44.1kHz stereo audio tracks, and Godot 4 scenes/scripts are assembled. "
             "Now running `godot --headless --quit` project-wide validation via `run_command` to verify zero script or resource errors.\n"
             "</think>"
         )
@@ -823,16 +1383,16 @@ def _synthesize_multi_phase_step(
                 },
             }
         ]
-        return f"{thinking}\n**Phase 4:** Running `godot --headless --quit` project-wide validation.", t_calls
+        return f"{thinking}\n**Phase 5:** Running `godot --headless --quit` project-wide validation.", t_calls
 
     # All phases complete
     thinking = (
         "<think>\n"
-        "All phases (2D textures/icons, 3D Blender `.glb` models, 2-in-1 SFX/Music audio tracks, and headless Godot validation) "
+        "All phases (2D textures/icons, 3D Blender `.glb` models, 2-in-1 SFX/Music audio tracks, Godot 4 scenes/scripts, and headless Godot validation) "
         "completed with 0 errors.\n"
         "</think>"
     )
-    return f"{thinking}\nAll multi-phase game assets, scenes, scripts, and headless Godot 4 validations completed with **0 errors**.", []
+    return f"{thinking}\nAll multi-phase game assets, scenes (`main.tscn`, `hud.tscn`), scripts (`paddle.gd`, `ball.gd`, `brick.gd`, `powerup.gd`), and headless Godot 4 validations completed with **0 errors**.", []
 
 
 def _synthesize_local_agent_response(
@@ -1204,6 +1764,7 @@ def get_full_status_snapshot() -> Dict[str, Any]:
         "installed": bool(godot_exe),
         "executable": godot_exe,
     }
+    snap["workspace_dir"] = str(tool_executor.workspace_dir)
     snap["require_command_approval"] = tool_executor.require_command_approval
     return snap
 
@@ -1495,6 +2056,146 @@ async def api_memory_flush() -> Dict[str, Any]:
 async def api_diff_rollback(req: DiffRollbackRequest) -> Dict[str, Any]:
     res = tool_executor.rollback_diff(req.diff_id)
     return {"result": res, "diffs": tool_executor.get_diff_history()}
+
+
+@app.get("/api/workspace/info")
+async def api_workspace_info() -> Dict[str, Any]:
+    ws_path = tool_executor.workspace_dir
+    proj_file = ws_path / "project.godot"
+    proj_name = ws_path.name
+    if proj_file.exists():
+        try:
+            txt = proj_file.read_text(encoding="utf-8", errors="replace")
+            m = re.search(r'config/name\s*=\s*"([^"]+)"', txt)
+            if m:
+                proj_name = m.group(1)
+        except Exception:
+            pass
+    return {
+        "workspace_dir": str(ws_path),
+        "project_name": proj_name,
+        "has_project_godot": proj_file.exists(),
+    }
+
+
+@app.post("/api/workspace/browse")
+async def api_workspace_browse(req: WorkspaceBrowseRequest) -> Dict[str, Any]:
+    """List subdirectories and available Windows drives for the in-app Folder Picker modal."""
+    target = Path(req.folder_path).resolve() if req.folder_path else tool_executor.workspace_dir.parent
+    if not target.exists() or not target.is_dir():
+        target = tool_executor.workspace_dir
+
+    drives: List[str] = []
+    if os.name == "nt":
+        for d_letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+            drive_root = Path(f"{d_letter}:\\")
+            if drive_root.exists():
+                drives.append(str(drive_root))
+
+    subdirs: List[Dict[str, Any]] = []
+    try:
+        for entry in sorted(target.iterdir(), key=lambda p: p.name.lower()):
+            if entry.is_dir() and not entry.name.startswith("."):
+                has_godot = (entry / "project.godot").exists()
+                subdirs.append(
+                    {
+                        "name": entry.name,
+                        "path": str(entry.resolve()),
+                        "has_project_godot": has_godot,
+                    }
+                )
+    except Exception as exc:
+        logger.debug(f"Browse folder warning for {target}: {exc}")
+
+    return {
+        "current_dir": str(target),
+        "parent_dir": str(target.parent) if target.parent != target else str(target),
+        "drives": drives,
+        "subdirs": subdirs[:200],
+    }
+
+
+async def _apply_workspace_folder_switch(
+    target_path: Path, init_starter_if_empty: bool = False
+) -> Dict[str, Any]:
+    global WORKSPACE_DIR
+    target_path = target_path.resolve()
+    target_path.mkdir(parents=True, exist_ok=True)
+
+    # Create standard Godot subdirectories if missing
+    for sub in ("scenes", "scripts", "assets/textures", "assets/models", "assets/audio", "assets/ui"):
+        (target_path / sub).mkdir(parents=True, exist_ok=True)
+
+    if init_starter_if_empty and not (target_path / "project.godot").exists():
+        ensure_starter_godot_workspace(target_path)
+    elif not (target_path / "project.godot").exists():
+        (target_path / "project.godot").write_text(
+            "; Engine configuration file.\n\n"
+            "config_version=5\n\n"
+            "[application]\n\n"
+            f'config/name="{target_path.name}"\n'
+            'config/features=PackedStringArray("4.3", "Forward Plus")\n',
+            encoding="utf-8",
+        )
+
+    WORKSPACE_DIR = target_path
+    tool_executor.set_workspace_dir(target_path)
+    await orchestrator.switch_session(
+        conversation_id=orchestrator.conversation_id,
+        project_root=str(target_path),
+        current_messages=CONVERSATION_HISTORY,
+    )
+    if CONVERSATION_HISTORY and CONVERSATION_HISTORY[0].get("role") == "system":
+        CONVERSATION_HISTORY[0]["content"] = orchestrator.memory_rag.build_static_system_prompt(
+            BASE_SYSTEM_PROMPT
+        )
+
+    snap = get_full_status_snapshot()
+    await ws_manager.broadcast("telemetry_update", snap)
+    await ws_manager.broadcast("workspace_changed", {"workspace_dir": str(target_path)})
+    return {
+        "status": "success",
+        "workspace_dir": str(target_path),
+        "telemetry": snap,
+    }
+
+
+@app.post("/api/workspace/select")
+async def api_workspace_select(req: WorkspaceSelectRequest) -> Dict[str, Any]:
+    """Switch the active Godot 4 project folder to any local path."""
+    raw = (req.folder_path or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="folder_path cannot be empty.")
+    return await _apply_workspace_folder_switch(
+        Path(raw), init_starter_if_empty=req.init_starter_if_empty
+    )
+
+
+@app.post("/api/workspace/pick_native")
+async def api_workspace_pick_native() -> Dict[str, Any]:
+    """Open the native Windows OS folder chooser dialog and switch to the chosen folder."""
+    def _open_tk_folder_dialog() -> Optional[str]:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            chosen = filedialog.askdirectory(
+                initialdir=str(tool_executor.workspace_dir.parent),
+                title="Select Godot 4 Project Folder — Local Agentic Harness",
+            )
+            root.destroy()
+            return chosen or None
+        except Exception as exc:
+            logger.warning(f"Native folder dialog fallback: {exc}")
+            return None
+
+    chosen_dir = await asyncio.to_thread(_open_tk_folder_dialog)
+    if not chosen_dir:
+        return {"status": "cancelled", "workspace_dir": str(tool_executor.workspace_dir)}
+    return await _apply_workspace_folder_switch(Path(chosen_dir), init_starter_if_empty=False)
 
 
 @app.get("/api/workspace/tree")
