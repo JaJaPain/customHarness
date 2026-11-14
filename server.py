@@ -11,8 +11,10 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
+import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -252,9 +254,9 @@ async def lifespan(app: FastAPI):
     main_event_loop = asyncio.get_running_loop()
     orchestrator.start_background_monitor(poll_interval_sec=3.0)
     if os.environ.get("HARNESS_OPEN_BROWSER") == "1":
-        import webbrowser
-
-        threading.Timer(0.8, lambda: webbrowser.open("http://127.0.0.1:8000")).start()
+        t = threading.Timer(0.8, lambda: webbrowser.open("http://127.0.0.1:8000"))
+        t.daemon = True
+        t.start()
     yield
     await orchestrator.shutdown_and_persist(CONVERSATION_HISTORY)
 
@@ -1563,4 +1565,4 @@ async def serve_index() -> HTMLResponse:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("server:app", host="127.0.0.1", port=8000, reload=False)
+    uvicorn.run(app, host="127.0.0.1", port=8000, reload=False)
