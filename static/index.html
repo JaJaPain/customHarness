@@ -3,91 +3,111 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Godot 4 Agentic Coding &amp; 2D/3D Asset Harness — Local RTX 3060 12GB</title>
+  <title>Godot 4 Agentic Harness — Local RTX 3060 12GB</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <!-- Top Live VRAM & Engine State Telemetry Bar -->
+  <!-- Clean Minimalist Top Bar (Claude Code / Antigravity / Codex Style) -->
   <header class="telemetry-bar">
     <div class="brand-cluster">
       <span class="brand-logo">◆</span>
-      <span class="brand-title">GODOT 4 LOCAL HARNESS</span>
+      <span class="brand-title">GODOT 4 HARNESS</span>
+      <button id="btn-folder-modal" class="folder-pill" title="Click to choose or switch active Godot 4 project folder">
+        <span>📁</span>
+        <span id="header-folder-name">workspace</span>
+        <span class="chevron-down">▾</span>
+      </button>
+    </div>
+
+    <!-- Compact Clickable Status Pill (Opens VRAM & Telemetry Inspector) -->
+    <button id="btn-status-pill" class="status-pill-btn" title="Click to inspect GPU VRAM, 3-Tier KV Cache, and Engine State">
+      <span class="status-dot"></span>
       <span id="state-badge" class="state-badge state-llm-active">LLM_ACTIVE</span>
-      <span id="kv-tier-badge" class="state-badge state-llm-active" title="Active 3-Tier KV Cache Hierarchy Status">KV: VRAM</span>
-    </div>
+      <span class="pill-sep">·</span>
+      <span id="kv-tier-badge" class="state-badge state-llm-active">KV: VRAM</span>
+      <span class="pill-sep">·</span>
+      <span id="vram-meter-text" class="mono-dim">8.4 / 12.0 GB</span>
+      <span class="pill-sep">·</span>
+      <span id="ctx-token-badge" class="mono-dim">~120 / 32k tok</span>
+    </button>
 
-    <div class="telemetry-summary" id="telemetry-status-text">
-      VRAM: 8.4/12GB | Engine: Ornith-9B [VRAM Fast] | KV: VRAM | Blender: Ready
-    </div>
-
-    <div class="meters-cluster">
-      <div class="meter-item" title="RTX 3060 12GB VRAM Allocation">
-        <div class="meter-label">
-          <span>GPU VRAM</span>
-          <span id="vram-meter-text">8.4 / 12.0 GB</span>
-        </div>
-        <div class="meter-track">
-          <div id="vram-meter-fill" class="meter-fill" style="width: 70%;"></div>
-        </div>
-      </div>
-
-      <div class="meter-item" title="32GB DDR4 System RAM (Tier 2 96k Context Spillover Target)">
-        <div class="meter-label">
-          <span>SYS RAM</span>
-          <span id="ram-meter-text">8.2 / 32.0 GB</span>
-        </div>
-        <div class="meter-track">
-          <div id="ram-meter-fill" class="meter-fill meter-fill-ram" style="width: 26%;"></div>
-        </div>
-      </div>
-    </div>
-
+    <!-- Right Controls & Clean Menu Trigger -->
     <div class="controls-cluster">
-      <select id="profile-select" class="toolbar-select" title="Switch Local GGUF VLM Profile">
-        <option value="ornith-9b">Ornith-1.5-9B-Q6_K + mmproj (Primary)</option>
-        <option value="gemma-4-12b">gemma-4-12b-it-Q4_0 (Optional Profile)</option>
-      </select>
-
-      <label class="toggle-pill" title="Require user approval before executing run_command">
-        <input type="checkbox" id="approval-toggle" />
-        <span>Gate Commands</span>
-      </label>
-
-      <button id="btn-godot-yield" class="toolbar-btn" title="Tier 5: Toggle Godot 3D Play-Mode VRAM Yield (>2.5GB)">
-        🎮 Yield VRAM
+      <button id="btn-toggle-files" class="toolbar-btn" title="Toggle Project Files & 3D Scene Graph Drawer">
+        📁 Files
       </button>
 
-      <button id="btn-folder-modal" class="toolbar-btn" title="Choose or Switch Active Godot 4 Project Folder">
-        📁 Project Folder
-      </button>
+      <div class="menu-dropdown-wrap">
+        <button id="btn-menu-toggle" class="toolbar-btn" title="Open Tools, Studio, Diffs & Telemetry Menu">
+          ☰ Menu &amp; Tools <span class="chevron-down">▾</span>
+        </button>
+        <div id="harness-dropdown-menu" class="dropdown-menu hidden">
+          <button class="dropdown-item" data-action="open-files">
+            <span>📁 Project Files &amp; 3D Scene Graph</span>
+            <span class="menu-shortcut">Left Drawer</span>
+          </button>
+          <button class="dropdown-item" data-action="open-folder-picker">
+            <span>📂 Choose Project Folder...</span>
+            <span class="menu-shortcut">Switch Dir</span>
+          </button>
+          <div class="dropdown-divider"></div>
+          <button class="dropdown-item" data-action="open-tab-diff">
+            <span>📝 Live Diffs &amp; Code Inspector</span>
+            <span class="menu-shortcut">.bak Rollbacks</span>
+          </button>
+          <button class="dropdown-item" data-action="open-tab-studio">
+            <span>🎨 2D / 3D / Audio Asset Studio</span>
+            <span class="menu-shortcut">Direct Gen</span>
+          </button>
+          <button class="dropdown-item" data-action="open-tab-vram">
+            <span>⚡ GPU VRAM &amp; 3-Tier KV Telemetry</span>
+            <span class="menu-shortcut">State Machine</span>
+          </button>
+          <div class="dropdown-divider"></div>
+          <button class="dropdown-item" data-action="toggle-quick-chips">
+            <span>🧪 Toggle Quick Test Prompts</span>
+            <span class="menu-shortcut">Chips Bar</span>
+          </button>
+          <button class="dropdown-item" data-action="yield-vram" id="btn-godot-yield">
+            <span>🎮 Yield VRAM to Godot Play-Mode</span>
+            <span class="menu-shortcut">&gt;2.5 GB</span>
+          </button>
+          <div class="dropdown-divider"></div>
+          <button class="dropdown-item" data-action="open-setup">
+            <span>⚙ Models, CUDA Binaries &amp; Setup</span>
+            <span class="menu-shortcut">Downloader</span>
+          </button>
+        </div>
+      </div>
 
-      <button id="btn-setup-modal" class="toolbar-btn toolbar-btn-accent" title="First-Run CUDA Binaries & GGUF Health Check">
-        ⚙ Setup &amp; Health
+      <button id="btn-setup-modal" class="toolbar-btn toolbar-btn-accent" title="Download Models, CUDA Binaries & Health Check">
+        ⚙ Setup
       </button>
     </div>
   </header>
 
-  <!-- Main 3-Pane Split Workspace -->
-  <main class="workspace-grid" id="drop-zone">
+  <!-- Main Workspace Stage (Centered Stream + Optional Slide-Over Drawers) -->
+  <main class="workspace-stage" id="drop-zone">
     <!-- Drag-and-Drop Overlay -->
     <div id="drop-overlay" class="drop-overlay hidden">
       <div class="drop-overlay-box">
         <div class="drop-icon">📥</div>
         <h3>Universal Multimodal Ingest Dropzone</h3>
-        <p>Drop Images (.png/.webp), Godot Files (.tscn/.tres/.gd/.gdshader), 3D Models (.glb/.blend/.obj), PDFs, or Folders</p>
+        <p>Drop Images (.png/.webp), Godot Files (.tscn/.tres/.gd/.gdshader), 3D Models (.glb/.blend/.obj), or PDFs</p>
       </div>
     </div>
 
-    <!-- LEFT PANE: Godot 4 Project Explorer & Scene Graph Summary -->
-    <aside class="pane pane-left">
+    <!-- LEFT SLIDE-OVER DRAWER: Godot 4 Project Explorer & Scene Graph (Hidden by Default for Clean UI) -->
+    <aside id="left-drawer" class="side-drawer side-drawer-left hidden">
       <div class="pane-header">
-        <span>GODOT 4 WORKSPACE (res://)</span>
+        <span>PROJECT FILES (res://)</span>
         <div style="display:flex; gap:4px; align-items:center;">
-          <button id="btn-change-folder-inline" class="mini-btn" title="Choose Godot 4 Project Folder">📁 Folder</button>
+          <button id="btn-change-folder-inline" class="mini-btn" title="Choose Godot 4 Project Folder">📁 Change</button>
           <button id="btn-refresh-tree" class="icon-btn" title="Refresh Workspace Tree">↻</button>
+          <button id="btn-close-left-drawer" class="icon-btn" title="Close Drawer">✕</button>
         </div>
       </div>
-      <div id="active-workspace-path-bar" style="padding:5px 10px; background:#0b1120; border-bottom:1px solid #1e293b; font-family:var(--font-mono); font-size:10.5px; color:#38bdf8; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="Active Project Folder">
+      <div id="active-workspace-path-bar" class="workspace-path-bar" title="Active Project Folder">
         ./workspace
       </div>
       <div id="file-tree" class="file-tree"></div>
@@ -99,57 +119,66 @@
       <pre id="scene-graph-summary" class="scene-graph-box">Loading Godot 4 3D Scene Graph...</pre>
     </aside>
 
-    <!-- CENTER PANE: Agentic Coding & Multimodal Asset Stream -->
-    <section class="pane pane-center">
-      <div class="pane-header">
-        <span>AGENTIC STREAM — ORNITH-1.5-9B + FLUX.1-SCHNELL + BLENDER 4.x</span>
-        <span id="ctx-token-badge" class="muted-tag">Ctx: ~120 / 32,768 tok (Tier 1 Fast VRAM)</span>
-      </div>
-
-      <!-- Quick-Action Workflow Chips -->
-      <div class="quick-actions-bar">
+    <!-- CENTER STAGE: Clean Focused Agent Stream (Claude Code / Antigravity / Codex Style) -->
+    <section class="center-stage">
+      <!-- Optional Quick-Action Workflow Chips (Hidden by default; toggleable from ☰ Menu) -->
+      <div id="quick-actions-bar" class="quick-actions-bar hidden">
         <button class="chip-btn" data-prompt="Generate a seamless PBR sci-fi floor texture with normal and roughness maps at res://assets/textures/scifi_floor.png">
-          🎨 2D PBR Texture Swap
+          🎨 2D PBR Texture
         </button>
         <button class="chip-btn" data-prompt="Generate a 2D transparent RPG shield UI icon at res://assets/textures/shield_icon.png">
           🛡️ 2D Sprite + rembg
         </button>
         <button class="chip-btn" data-prompt="Create a 3D sci-fi pillar in Blender with a -colonly collision mesh and export to res://assets/models/sci_fi_pillar.glb">
-          🧊 3D Blender .glb + Contact Sheet
+          🧊 3D Blender .glb
         </button>
         <button class="chip-btn" data-prompt="Generate a punchy sci-fi plasma rifle laser sound effect (mode='sfx') at res://audio/sfx/plasma_rifle.wav and inspect its Waveform + Mel-Spectrogram">
-          🔊 2-in-1 Audio SFX/Music + Spectrogram
+          🔊 Audio SFX + Spectrogram
         </button>
         <button class="chip-btn" data-prompt="Edit res://scripts/player_controller.gd to add sprint_multiplier and increase move_speed using apply_diff">
           ⚡ Edit GDScript + Diff
         </button>
         <button class="chip-btn" data-prompt="Use recall_memory to search our archived Godot 4 project memory for collision layers, player_controller settings, and node paths">
-          🔍 Recall Memory (0-VRAM RAG)
+          🔍 Recall Memory (RAG)
         </button>
         <button class="chip-btn" id="btn-test-tier2">
-          🧠 Test Tier 2 (96k RAM Spillover)
+          🧠 Test 96k RAM Overflow
         </button>
       </div>
 
-      <!-- Chat Message Stream -->
+      <!-- Centered Conversation & Process Stream -->
       <div id="chat-stream" class="chat-stream">
         <div class="msg msg-assistant">
           <div class="msg-header">
-            <span class="msg-role">ORNITH-9B HARNESS</span>
-            <span class="msg-meta">Tier 1 Fast VRAM Mode (32,768 ctx | q8_0 KV Cache)</span>
+            <span class="msg-role">GODOT 4 AGENTIC HARNESS</span>
+            <span class="msg-meta">Ready · Click any process row (&gt;) to inspect details</span>
           </div>
-          <details class="think-drawer">
-            <summary>💭 Reasoning Trace (&lt;think&gt;...&lt;/think&gt; parsed cleanly before JSON tool dispatch)</summary>
-            <div class="think-content">Initialized zero-wrapper local Windows 11 harness for NVIDIA RTX 3060 (12GB VRAM) + 32GB DDR4 RAM.
-Verified mutual exclusion between `llama-server.exe` and `sd.exe`, KV cache slot persistence (`./cache/slots/active_session.bin`), and headless Blender 4.x Godot export wrapper.</div>
-          </details>
-          <div class="msg-body">
-            Welcome to the **Standalone Local-First Godot 4 Agentic Coding &amp; 2D/3D Asset Harness**.
-            <ul>
-              <li><strong>Drag &amp; Drop or Ctrl+V Paste</strong> any image, <code>.tscn</code>, <code>.tres</code>, <code>.gd</code>, <code>.glb</code>, <code>.blend</code>, or <code>.pdf</code> directly into the prompt box below.</li>
-              <li><strong>Tier 3 Atomic 2D Swap</strong> snapshots KV slot 0, unloads the LLM, runs 4-step <code>FLUX.1-schnell</code> + Sobel PBR maps, restores the LLM, and runs a <strong>Closed-Loop Vision Self-Check</strong>.</li>
-              <li><strong>Tier 4 Headless Blender 3D</strong> wraps <code>bpy</code> scripts in the Godot 4 Export Harness (<code>+Y</code> up, applied transforms, <code>-col</code> suffixes) and injects a <strong>3-Angle Visual Verification Contact Sheet</strong> into the VLM.</li>
-            </ul>
+
+          <!-- Example Antigravity-style expandable process row -->
+          <div class="process-list">
+            <details class="process-row">
+              <summary class="process-summary">
+                <span class="process-left">
+                  <span class="process-icon process-icon-ok">✓</span>
+                  <span class="process-title">Initialized local engines &amp; 3-Tier KV cache</span>
+                  <code class="process-target">RTX 3060 12GB · 0-VRAM RAG</code>
+                </span>
+                <span class="process-right">
+                  <span class="process-meta">Ready</span>
+                  <span class="process-chevron">›</span>
+                </span>
+              </summary>
+              <div class="process-details">
+                <div id="telemetry-status-text" style="margin-bottom:6px; color:#cbd5e1;">
+                  VRAM: 8.4/12GB | Engine: Ornith-9B [VRAM Fast] | KV: VRAM | Blender: Ready
+                </div>
+                <div>Mutual exclusion active between <code>llama-server.exe</code>, <code>sd.exe</code> (FLUX.1-schnell), and <code>StableAudioPipeline</code> (FP16), with headless Blender 4.x <code>.glb</code> export and automatic Closed-Loop Vision Self-Check.</div>
+              </div>
+            </details>
+          </div>
+
+          <div class="msg-body" style="margin-top:8px;">
+            Describe the Godot 4 game, feature, 3D model, 2D texture, or audio asset you want to build. Every step and tool execution will appear below as an expandable line—press <strong><code>›</code></strong> at the end of any line to dive deeper into its reasoning, code diff, 3D contact sheet, or spectrogram.
           </div>
         </div>
       </div>
@@ -157,32 +186,35 @@ Verified mutual exclusion between `llama-server.exe` and `sd.exe`, KV cache slot
       <!-- Multimodal Attachment Tray -->
       <div id="attachment-tray" class="attachment-tray hidden"></div>
 
-      <!-- Prompt Input Box -->
-      <form id="chat-form" class="prompt-composer">
-        <div class="composer-toolbar">
-          <label class="file-upload-btn" title="Attach Images, .tscn, .gd, .glb, .blend, .pdf">
-            📎 Attach Files
-            <input type="file" id="file-input" multiple hidden />
-          </label>
-          <span class="composer-hint">Supports Drag &amp; Drop + Ctrl+V Clipboard Paste (Images auto-resized ≤1568px, .tscn parsed to 3D Scene Graph)</span>
-        </div>
-        <div class="composer-input-row">
+      <!-- Clean Centered Prompt Composer -->
+      <div class="composer-container">
+        <form id="chat-form" class="prompt-composer">
           <textarea
             id="prompt-input"
             rows="3"
-            placeholder="Ask the agent to write Godot 4 GDScript, edit .tscn scenes, generate 2D PBR textures/sprites, or model 3D .glb assets in Blender..."
+            placeholder="Ask the harness to build a Godot 4 game, generate 2D/3D/audio assets, or edit scenes &amp; scripts..."
           ></textarea>
-          <button type="submit" id="btn-send" class="send-btn">Send ↵</button>
-        </div>
-      </form>
+          <div class="composer-footer">
+            <div class="composer-footer-left">
+              <label class="file-upload-btn" title="Attach Images, .tscn, .gd, .glb, .blend, .pdf">
+                📎 Attach
+                <input type="file" id="file-input" multiple hidden />
+              </label>
+              <span class="composer-hint">Drag &amp; drop or Ctrl+V paste files/images</span>
+            </div>
+            <button type="submit" id="btn-send" class="send-btn">Send ↵</button>
+          </div>
+        </form>
+      </div>
     </section>
 
-    <!-- RIGHT PANE: Live Code Diff Viewer, 2D/3D Asset Studio, & VRAM State Machine -->
-    <aside class="pane pane-right">
+    <!-- RIGHT SLIDE-OVER DRAWER: Diffs, Studio, & VRAM Telemetry (Hidden by Default; Opened via Menu or Status Pill) -->
+    <aside id="right-drawer" class="side-drawer side-drawer-right hidden">
       <div class="right-tabs">
-        <button class="tab-btn active" data-tab="tab-diff">Live Diff &amp; Code</button>
-        <button class="tab-btn" data-tab="tab-studio">2D/3D Asset Studio</button>
-        <button class="tab-btn" data-tab="tab-vram">VRAM State &amp; CLI</button>
+        <button class="tab-btn active" data-tab="tab-diff">Diffs &amp; Code</button>
+        <button class="tab-btn" data-tab="tab-studio">Asset Studio</button>
+        <button class="tab-btn" data-tab="tab-vram">VRAM &amp; Engine</button>
+        <button id="btn-close-right-drawer" class="icon-btn" style="margin:auto 8px;" title="Close Inspector">✕</button>
       </div>
 
       <!-- TAB 1: Live Code Diff Viewer & File Inspector -->
@@ -199,10 +231,10 @@ Verified mutual exclusion between `llama-server.exe` and `sd.exe`, KV cache slot
           <span>FILE SOURCE INSPECTOR</span>
           <button id="btn-attach-current-file" class="mini-btn">+ Attach to Prompt</button>
         </div>
-        <pre id="file-viewer-code" class="code-viewer">Select a file from the left explorer to inspect line-numbered source.</pre>
+        <pre id="file-viewer-code" class="code-viewer">Select a file from the Files drawer to inspect line-numbered source.</pre>
       </div>
 
-      <!-- TAB 2: Direct 2D / 3D Asset Studio & Preview Gallery -->
+      <!-- TAB 2: Direct 2D / 3D / Audio Asset Studio & Preview Gallery -->
       <div id="tab-studio" class="tab-panel hidden">
         <div class="studio-section">
           <h4>🎨 Tier 3: 2D Asset Generator (FLUX.1-schnell + PBR)</h4>
@@ -225,8 +257,8 @@ Verified mutual exclusion between `llama-server.exe` and `sd.exe`, KV cache slot
 
         <div class="studio-section">
           <h4>🧊 Tier 4: Headless Blender 3D Harness (.glb + 3-View Sheet)</h4>
-          <input type="text" id="studio-3d-path" class="studio-input" value="res://assets/models/ armored_crate.glb" />
-          <textarea id="studio-3d-script" class="studio-textarea" rows="5">import bpy
+          <input type="text" id="studio-3d-path" class="studio-input" value="res://assets/models/armored_crate.glb" />
+          <textarea id="studio-3d-script" class="studio-textarea" rows="4">import bpy
 bpy.ops.mesh.primitive_cube_add(size=1.4, location=(0, 0, 0.7))
 crate = bpy.context.active_object
 crate.name = "ArmoredCrate"
@@ -264,6 +296,39 @@ col.name = "ArmoredCrate-colonly"</textarea>
       <!-- TAB 3: VRAM Orchestrator State Machine & Subprocess Console -->
       <div id="tab-vram" class="tab-panel hidden">
         <div class="studio-section">
+          <h4>📊 Hardware &amp; Model Controls</h4>
+          <div class="meters-cluster" style="margin-bottom:8px;">
+            <div class="meter-item" style="flex:1;">
+              <div class="meter-label">
+                <span>GPU VRAM</span>
+              </div>
+              <div class="meter-track">
+                <div id="vram-meter-fill" class="meter-fill" style="width: 70%;"></div>
+              </div>
+            </div>
+            <div class="meter-item" style="flex:1;">
+              <div class="meter-label">
+                <span>SYS RAM</span>
+                <span id="ram-meter-text">8.2 / 32.0 GB</span>
+              </div>
+              <div class="meter-track">
+                <div id="ram-meter-fill" class="meter-fill meter-fill-ram" style="width: 26%;"></div>
+              </div>
+            </div>
+          </div>
+          <div class="studio-row">
+            <select id="profile-select" class="toolbar-select" style="flex:1;" title="Switch Local GGUF VLM Profile">
+              <option value="ornith-9b">Ornith-1.5-9B-Q6_K + mmproj (Primary)</option>
+              <option value="gemma-4-12b">gemma-4-12b-it-Q4_0 (Optional Profile)</option>
+            </select>
+            <label class="toggle-pill" title="Require user approval before executing run_command">
+              <input type="checkbox" id="approval-toggle" />
+              <span>Gate CLI</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="studio-section">
           <h4>⚡ VRAMOrchestrator State Machine</h4>
           <div class="state-grid" id="state-machine-grid">
             <div class="state-node active" data-state="LLM_ACTIVE">Tier 1: LLM_ACTIVE</div>
@@ -284,11 +349,11 @@ col.name = "ArmoredCrate-colonly"</textarea>
             <div class="state-node" data-kv-tier="KV: RAM Spill">KV: RAM Spill</div>
             <div class="state-node" data-kv-tier="KV: Disk Restored">KV: Disk Restored</div>
           </div>
-          <div class="studio-row" style="margin-top:4px;">
-            <span id="kv-disk-summary" style="font-family:var(--font-mono); font-size:10.5px; color:#94a3b8;">
-              NVMe Disk Cache (./cache/kv_disk): 0.00 MB / 15.0 GB LRU Cap
+          <div class="studio-row" style="margin-top:6px;">
+            <span id="kv-disk-summary" style="font-size:11px; color:#94a3b8;">
+              NVMe Disk (./cache/kv_disk): 0.0 MB / 15.0 GB LRU Cap
             </span>
-            <select id="session-select" class="toolbar-select" title="Switch Session (Saves outgoing slot to ./cache/kv_disk & restores target slot)">
+            <select id="session-select" class="toolbar-select" title="Switch Session">
               <option value="default">Session: default</option>
               <option value="shader_pipeline">Session: shader_pipeline</option>
               <option value="level_greybox">Session: level_greybox</option>

@@ -134,15 +134,21 @@ function updateTelemetryUI(data) {
 
   const ctxTokens = data.estimated_context_tokens || 120;
   const maxCtx = data.active_profile?.context_window || 32768;
-  const tierLabel = data.state === "HYBRID_RAM_OVERFLOW" ? "Tier 2 96k RAM Overflow" : "Tier 1 Fast VRAM";
+  const maxK = Math.round(maxCtx / 1024);
   document.getElementById("ctx-token-badge").textContent =
-    `Ctx: ~${ctxTokens.toLocaleString()} / ${maxCtx.toLocaleString()} tok (${tierLabel})`;
+    `~${ctxTokens.toLocaleString()} / ${maxK}k tok`;
 
   if (data.workspace_dir) {
     const wsBar = document.getElementById("active-workspace-path-bar");
     if (wsBar) {
       wsBar.textContent = `📁 ${data.workspace_dir}`;
       wsBar.title = `Active Godot 4 Project Folder: ${data.workspace_dir}`;
+    }
+    const headerFolder = document.getElementById("header-folder-name");
+    if (headerFolder) {
+      const parts = String(data.workspace_dir).replace(/\\/g, "/").split("/").filter(Boolean);
+      headerFolder.textContent = parts[parts.length - 1] || data.workspace_dir;
+      headerFolder.title = data.workspace_dir;
     }
   }
 
@@ -209,6 +215,7 @@ async function loadWorkspaceTree() {
     container.querySelectorAll(".tree-item").forEach((el) => {
       el.addEventListener("click", () => {
         inspectWorkspaceFile(el.dataset.resPath);
+        openRightDrawerTab("tab-diff");
       });
     });
   } catch (err) {
@@ -222,6 +229,7 @@ function getFileIcon(name) {
   if (lower.endsWith(".gd")) return "📜";
   if (lower.endsWith(".glb") || lower.endsWith(".blend")) return "🧊";
   if (lower.endsWith(".png") || lower.endsWith(".webp")) return "🖼️";
+  if (lower.endsWith(".wav") || lower.endsWith(".ogg") || lower.endsWith(".mp3")) return "🔊";
   if (lower.endsWith(".godot")) return "⚙️";
   return "📄";
 }
@@ -249,18 +257,89 @@ async function inspectWorkspaceFile(resPath) {
 }
 
 // ============================================================================
-// Universal Drag-and-Drop & Clipboard Paste Multimodal Pipeline
+// Universal Drag-and-Drop, Drawers, Menu & UI Events
 // ============================================================================
+function openRightDrawerTab(tabId) {
+  const rightDrawer = document.getElementById("right-drawer");
+  if (rightDrawer) rightDrawer.classList.remove("hidden");
+  document.querySelectorAll(".tab-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.tab === tabId);
+  });
+  document.querySelectorAll(".tab-panel").forEach((p) => {
+    p.classList.toggle("hidden", p.id !== tabId);
+  });
+}
+
+function toggleLeftDrawer(forceOpen = null) {
+  const leftDrawer = document.getElementById("left-drawer");
+  if (!leftDrawer) return;
+  if (forceOpen === true) {
+    leftDrawer.classList.remove("hidden");
+  } else if (forceOpen === false) {
+    leftDrawer.classList.add("hidden");
+  } else {
+    leftDrawer.classList.toggle("hidden");
+  }
+}
+
 function bindUIEvents() {
   // Right-pane Tabs
   document.querySelectorAll(".tab-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
-      document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
-      document.querySelectorAll(".tab-panel").forEach((p) => p.classList.add("hidden"));
-      btn.classList.add("active");
-      document.getElementById(btn.dataset.tab).classList.remove("hidden");
+      openRightDrawerTab(btn.dataset.tab);
     });
   });
+
+  // Left & Right Drawer Toggle Buttons
+  const btnToggleFiles = document.getElementById("btn-toggle-files");
+  if (btnToggleFiles) {
+    btnToggleFiles.addEventListener("click", () => toggleLeftDrawer());
+  }
+  const btnCloseLeft = document.getElementById("btn-close-left-drawer");
+  if (btnCloseLeft) {
+    btnCloseLeft.addEventListener("click", () => toggleLeftDrawer(false));
+  }
+  const btnCloseRight = document.getElementById("btn-close-right-drawer");
+  if (btnCloseRight) {
+    btnCloseRight.addEventListener("click", () => {
+      document.getElementById("right-drawer")?.classList.add("hidden");
+    });
+  }
+
+  // Clickable Top Status Pill -> Opens VRAM & Engine Tab
+  const btnStatusPill = document.getElementById("btn-status-pill");
+  if (btnStatusPill) {
+    btnStatusPill.addEventListener("click", () => openRightDrawerTab("tab-vram"));
+  }
+
+  // Top "☰ Menu & Tools" Dropdown
+  const btnMenuToggle = document.getElementById("btn-menu-toggle");
+  const dropdownMenu = document.getElementById("harness-dropdown-menu");
+  if (btnMenuToggle && dropdownMenu) {
+    btnMenuToggle.addEventListener("click", (e) => {
+      e.stopPropagation();
+      dropdownMenu.classList.toggle("hidden");
+    });
+    window.addEventListener("click", () => {
+      dropdownMenu.classList.add("hidden");
+    });
+    dropdownMenu.querySelectorAll(".dropdown-item").forEach((item) => {
+      item.addEventListener("click", () => {
+        dropdownMenu.classList.add("hidden");
+        const act = item.dataset.action;
+        if (act === "open-files") toggleLeftDrawer(true);
+        else if (act === "open-folder-picker") openFolderModal();
+        else if (act === "open-tab-diff") openRightDrawerTab("tab-diff");
+        else if (act === "open-tab-studio") openRightDrawerTab("tab-studio");
+        else if (act === "open-tab-vram") openRightDrawerTab("tab-vram");
+        else if (act === "toggle-quick-chips") {
+          document.getElementById("quick-actions-bar")?.classList.toggle("hidden");
+        } else if (act === "open-setup") {
+          openSetupModal();
+        }
+      });
+    });
+  }
 
   // Quick-action chips
   document.querySelectorAll(".chip-btn[data-prompt]").forEach((btn) => {
@@ -677,13 +756,39 @@ function renderAttachmentTray() {
 }
 
 // ============================================================================
-// Agentic Chat Execution & Live Step/Tool Progress Feedback
+// Antigravity / Claude Code / Codex Expandable Process Rows (>)
 // ============================================================================
+function describeToolAction(toolName, args = {}, targetHint = "") {
+  const path =
+    targetHint ||
+    args.output_path ||
+    args.output_glb_path ||
+    args.path ||
+    args.command ||
+    args.query ||
+    "";
+  const map = {
+    generate_2d_asset: "Generate 2D texture / sprite",
+    run_blender_script: "Model 3D .glb asset in Blender",
+    generate_game_audio: `Synthesize ${args.mode === "music_loop" ? "music loop" : "sound effect"}`,
+    write_file: "Write file",
+    apply_diff: "Edit file (SEARCH/REPLACE diff)",
+    read_file: "Read file",
+    list_dir: "List workspace directory",
+    recall_memory: "Recall project memory (0-VRAM RAG)",
+    run_command: "Run validation / command",
+  };
+  return {
+    title: map[toolName] || `Run ${toolName}`,
+    target: path,
+  };
+}
+
 function handleLiveStepStart(data) {
   const statusHeader = document.getElementById("active-progress-header");
   const sendBtn = document.getElementById("btn-send");
   if (statusHeader && data) {
-    statusHeader.innerHTML = `⚡ <strong>Autonomous ReAct Step ${data.step} / ${data.max_steps || 12}</strong> — Planning &amp; Selecting Tools...`;
+    statusHeader.textContent = `Step ${data.step} — Planning & executing tools...`;
   }
   if (sendBtn && sendBtn.disabled && data) {
     sendBtn.textContent = `Step ${data.step}...`;
@@ -695,20 +800,33 @@ function handleLiveToolStart(data) {
   const listEl = document.getElementById("active-progress-list");
   const statusHeader = document.getElementById("active-progress-header");
   const sendBtn = document.getElementById("btn-send");
-  const hint = data.target_hint ? ` → <code>${escapeHtml(data.target_hint)}</code>` : "";
+  const desc = describeToolAction(data.name, data.arguments || {}, data.target_hint || "");
 
   if (statusHeader) {
-    statusHeader.innerHTML = `⚡ <strong>Step ${data.step || 1} (${data.tool_index || 1}/${data.tool_count || 1})</strong> — Running <code>${escapeHtml(data.name)}</code>${hint}...`;
+    statusHeader.textContent = `Step ${data.step || 1} (${data.tool_index || 1}/${data.tool_count || 1}) · ${desc.title}`;
   }
   if (sendBtn && sendBtn.disabled) {
-    sendBtn.textContent = `Running ${data.name}...`;
+    sendBtn.textContent = `Running...`;
   }
   if (listEl) {
-    const row = document.createElement("div");
-    row.id = `live-tool-${data.id}`;
-    row.style.cssText = "padding:3px 0; font-size:11.5px; color:#93c5fd;";
-    row.innerHTML = `⏳ <strong>[Step ${data.step || 1}]</strong> <code>${escapeHtml(data.name)}</code>${hint} <em>(in progress...)</em>`;
-    listEl.appendChild(row);
+    const details = document.createElement("details");
+    details.id = `live-tool-${data.id}`;
+    details.className = "process-row";
+    details.innerHTML = `
+      <summary class="process-summary">
+        <span class="process-left">
+          <span class="process-icon process-icon-run" id="live-icon-${data.id}">⏳</span>
+          <span class="process-title">${escapeHtml(desc.title)}</span>
+          ${desc.target ? `<code class="process-target">${escapeHtml(desc.target)}</code>` : ""}
+        </span>
+        <span class="process-right">
+          <span class="process-meta" id="live-meta-${data.id}">Running...</span>
+          <span class="process-chevron">›</span>
+        </span>
+      </summary>
+      <div class="process-details" id="live-details-${data.id}">Tool: ${escapeHtml(data.name)}\nArguments: ${escapeHtml(JSON.stringify(data.arguments || {}, null, 2))}</div>
+    `;
+    listEl.appendChild(details);
     const stream = document.getElementById("chat-stream");
     if (stream) stream.scrollTop = stream.scrollHeight;
   }
@@ -716,13 +834,22 @@ function handleLiveToolStart(data) {
 
 function handleLiveToolComplete(data) {
   if (!data) return;
-  const row = document.getElementById(`live-tool-${data.id}`);
-  const hint = data.target_hint ? ` → <code>${escapeHtml(data.target_hint)}</code>` : "";
-  const elapsed = data.elapsed_sec != null ? ` (${data.elapsed_sec}s)` : "";
+  const iconEl = document.getElementById(`live-icon-${data.id}`);
+  const metaEl = document.getElementById(`live-meta-${data.id}`);
+  const detailsEl = document.getElementById(`live-details-${data.id}`);
   const ok = data.result?.status !== "error";
-  if (row) {
-    row.style.color = ok ? "#34d399" : "#f87171";
-    row.innerHTML = `${ok ? "✓" : "✗"} <strong>[Step ${data.step || 1}]</strong> <code>${escapeHtml(data.name)}</code>${hint}${escapeHtml(elapsed)}`;
+  if (iconEl) {
+    iconEl.className = `process-icon ${ok ? "process-icon-ok" : "process-icon-err"}`;
+    iconEl.textContent = ok ? "✓" : "✗";
+  }
+  if (metaEl) {
+    metaEl.textContent = data.elapsed_sec != null ? `${data.elapsed_sec}s` : "Done";
+  }
+  if (detailsEl && data.result) {
+    const previewHtml = buildToolPreviewHtml(data.name, data.result);
+    if (previewHtml) {
+      detailsEl.innerHTML += previewHtml;
+    }
   }
   if (
     data.result &&
@@ -752,27 +879,23 @@ async function sendChatPrompt(promptText, simulateContextTokens = null) {
     .join(" ");
   userDiv.innerHTML = `
     <div class="msg-header">
-      <span class="msg-role">DEVELOPER</span>
+      <span class="msg-role">YOU</span>
       <span class="msg-meta">${new Date().toLocaleTimeString()}</span>
     </div>
     <div class="msg-body">${escapeHtml(promptText)}${attBadges ? `<div style="margin-top:6px">${attBadges}</div>` : ""}</div>
   `;
   stream.appendChild(userDiv);
 
-  // Append Live In-Progress Execution Card
+  // Append Live Antigravity-Style Expandable Process Card
   const progressCard = document.createElement("div");
   progressCard.id = "active-progress-card";
   progressCard.className = "msg msg-assistant";
-  progressCard.style.borderLeft = "3px solid #38bdf8";
   progressCard.innerHTML = `
     <div class="msg-header">
-      <span class="msg-role" style="color:#38bdf8;">⚡ HARNESS EXECUTING PIPELINE</span>
-      <span class="msg-meta">Live WebSocket Stream</span>
+      <span class="msg-role" style="color:#60a5fa;">● WORKING</span>
+      <span class="msg-meta" id="active-progress-header">Initializing step 1...</span>
     </div>
-    <div id="active-progress-header" style="font-size:12px; color:#e2e8f0; margin-bottom:6px;">
-      ⚡ Initializing ReAct loop &amp; checking VRAM state...
-    </div>
-    <div id="active-progress-list" style="border-top:1px solid #1e293b; padding-top:6px; max-height:220px; overflow-y:auto;"></div>
+    <div id="active-progress-list" class="process-list"></div>
   `;
   stream.appendChild(progressCard);
   progressCard.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -816,17 +939,32 @@ function appendAssistantTurnCard(data) {
   const card = document.createElement("div");
   card.className = "msg msg-assistant";
 
-  const thinkHtml = data.thinking
+  const thinkRowHtml = data.thinking
     ? `
-      <details class="think-drawer" open>
-        <summary>💭 Reasoning Trace (&lt;think&gt;...&lt;/think&gt;)</summary>
-        <div class="think-content">${escapeHtml(data.thinking)}</div>
+      <details class="process-row">
+        <summary class="process-summary">
+          <span class="process-left">
+            <span class="process-icon process-icon-think">💭</span>
+            <span class="process-title">Reasoning trace</span>
+            <code class="process-target">&lt;think&gt;...&lt;/think&gt;</code>
+          </span>
+          <span class="process-right">
+            <span class="process-meta">Expand</span>
+            <span class="process-chevron">›</span>
+          </span>
+        </summary>
+        <div class="process-details">${escapeHtml(data.thinking)}</div>
       </details>`
     : "";
 
-  const toolsHtml = (data.tool_calls || [])
+  const toolRowsHtml = (data.tool_calls || [])
     .map((tc) => renderToolCallCard(tc))
     .join("");
+
+  const processListHtml =
+    thinkRowHtml || toolRowsHtml
+      ? `<div class="process-list">${thinkRowHtml}${toolRowsHtml}</div>`
+      : "";
 
   const compactionBanner = data.tier2_compaction
     ? `<div class="badge-vision-check" style="margin-bottom:8px;">
@@ -834,28 +972,25 @@ function appendAssistantTurnCard(data) {
        </div>`
     : "";
 
+  const toolCount = (data.tool_calls || []).length;
   card.innerHTML = `
     <div class="msg-header">
-      <span class="msg-role">ORNITH-9B HARNESS</span>
-      <span class="msg-meta">${new Date().toLocaleTimeString()}</span>
+      <span class="msg-role">GODOT 4 HARNESS</span>
+      <span class="msg-meta">${toolCount > 0 ? `${toolCount} process step${toolCount > 1 ? "s" : ""} · ` : ""}${new Date().toLocaleTimeString()}</span>
     </div>
     ${compactionBanner}
-    ${thinkHtml}
+    ${processListHtml}
     <div class="msg-body">${formatMarkdownLite(data.content || "")}</div>
-    ${toolsHtml}
   `;
 
   stream.appendChild(card);
   return card;
 }
 
-function renderToolCallCard(tc) {
-  const res = tc.result || {};
-  let previewHtml = "";
-
-  if (tc.name === "generate_2d_asset" && res.closed_loop_vision_check?.image_url) {
+function buildToolPreviewHtml(toolName, res = {}) {
+  if (toolName === "generate_2d_asset" && res.closed_loop_vision_check?.image_url) {
     const pbr = res.pbr_maps || {};
-    previewHtml = `
+    return `
       <div class="preview-card">
         <div>
           <span class="badge-vision-check">✓ Closed-Loop Vision Self-Check Passed</span>
@@ -873,8 +1008,9 @@ function renderToolCallCard(tc) {
         }
       </div>
     `;
-  } else if (tc.name === "run_blender_script" && res.contact_sheet?.image_url) {
-    previewHtml = `
+  }
+  if (toolName === "run_blender_script" && res.contact_sheet?.image_url) {
+    return `
       <div class="preview-card">
         <div>
           <span class="badge-vision-check">✓ 3-Angle Visual Verification Contact Sheet (Front -Y | 3/4 Iso | Wireframe/Top)</span>
@@ -883,8 +1019,9 @@ function renderToolCallCard(tc) {
         <img src="${res.contact_sheet.image_url}" alt="3-Angle Blender Contact Sheet" />
       </div>
     `;
-  } else if (tc.name === "generate_game_audio" && res.closed_loop_vision_check?.image_url) {
-    previewHtml = `
+  }
+  if (toolName === "generate_game_audio" && res.closed_loop_vision_check?.image_url) {
+    return `
       <div class="preview-card">
         <div>
           <span class="badge-vision-check">✓ Waveform + Mel-Spectrogram Vision Check Passed</span>
@@ -893,8 +1030,9 @@ function renderToolCallCard(tc) {
         <img src="${res.closed_loop_vision_check.image_url}" alt="Audio Waveform and Mel-Spectrogram" />
       </div>
     `;
-  } else if (res.status === "approval_required" && res.cmd_id) {
-    previewHtml = `
+  }
+  if (res.status === "approval_required" && res.cmd_id) {
+    return `
       <div style="margin-top:8px;">
         <button class="mini-btn mini-btn-accent" onclick="approveCommand('${res.cmd_id}')">
           ✓ Approve &amp; Run Command: ${escapeHtml(res.command)}
@@ -902,18 +1040,31 @@ function renderToolCallCard(tc) {
       </div>
     `;
   }
+  return "";
+}
+
+function renderToolCallCard(tc) {
+  const res = tc.result || {};
+  const ok = res.status !== "error";
+  const desc = describeToolAction(tc.name, tc.arguments || {}, tc.target_hint || "");
+  const elapsed = tc.elapsed_sec != null ? `${tc.elapsed_sec}s` : res.status || "done";
+  const previewHtml = buildToolPreviewHtml(tc.name, res);
 
   return `
-    <div class="tool-card">
-      <div class="tool-card-header">
-        <span>🔧 Tool: <strong>${escapeHtml(tc.name)}</strong></span>
-        <span>${escapeHtml(res.status || "done")}</span>
-      </div>
-      <div style="font-family:var(--font-mono); font-size:11px; color:#94a3b8;">
-        Args: ${escapeHtml(JSON.stringify(tc.arguments))}
-      </div>
-      ${previewHtml}
-    </div>
+    <details class="process-row">
+      <summary class="process-summary">
+        <span class="process-left">
+          <span class="process-icon ${ok ? "process-icon-ok" : "process-icon-err"}">${ok ? "✓" : "✗"}</span>
+          <span class="process-title">${escapeHtml(desc.title)}</span>
+          ${desc.target ? `<code class="process-target">${escapeHtml(desc.target)}</code>` : ""}
+        </span>
+        <span class="process-right">
+          <span class="process-meta">${escapeHtml(elapsed)}</span>
+          <span class="process-chevron">›</span>
+        </span>
+      </summary>
+      <div class="process-details">Tool: ${escapeHtml(tc.name)}\nArgs: ${escapeHtml(JSON.stringify(tc.arguments || {}, null, 2))}${previewHtml}</div>
+    </details>
   `;
 }
 
