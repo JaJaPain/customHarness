@@ -565,29 +565,43 @@ class AgentToolExecutor:
             self._cached_godot_exe = str(Path(env_godot).resolve())
             return self._cached_godot_exe
 
-        for bin_name in ("godot", "godot4", "Godot_v4.exe"):
+        for bin_name in (
+            "godot",
+            "godot4",
+            "Godot_v4.exe",
+            "Godot_v4.6.3-stable_win64_console.exe",
+            "Godot_v4.6.3-stable_win64.exe",
+            "Godot_v4.3-stable_win64_console.exe",
+            "Godot_v4.3-stable_win64.exe",
+        ):
             which_g = shutil.which(bin_name)
             if which_g:
                 self._cached_godot_exe = str(Path(which_g).resolve())
                 return self._cached_godot_exe
 
         search_dirs = [
+            Path(r"D:\CodingProjects\spacegame\Godot"),
+            Path(r"D:\Godot"),
+            Path(r"C:\Godot"),
             Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Godot",
+            Path(r"D:\Program Files\Godot"),
             Path(os.environ.get("LOCALAPPDATA", r"C:\Users\Default\AppData\Local")) / "Godot",
             Path.home() / "Desktop",
             Path.home() / "Downloads",
-            Path(r"C:\Godot"),
         ]
         for d in search_dirs:
-            if not d.exists():
-                continue
-            for exe in sorted(d.glob("Godot_v4*.exe"), reverse=True):
-                if "console" in exe.name.lower():
+            try:
+                if not d.exists():
+                    continue
+                for exe in sorted(d.glob("Godot_v4*.exe"), reverse=True):
+                    if "console" in exe.name.lower():
+                        self._cached_godot_exe = str(exe.resolve())
+                        return self._cached_godot_exe
+                for exe in sorted(d.glob("Godot_v4*.exe"), reverse=True):
                     self._cached_godot_exe = str(exe.resolve())
                     return self._cached_godot_exe
-            for exe in sorted(d.glob("Godot_v4*.exe"), reverse=True):
-                self._cached_godot_exe = str(exe.resolve())
-                return self._cached_godot_exe
+            except Exception:
+                continue
 
         return None
 

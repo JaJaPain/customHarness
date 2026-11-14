@@ -15,6 +15,10 @@ if not exist "cache\slots" mkdir "cache\slots"
 if not exist "cache\kv_disk" mkdir "cache\kv_disk"
 if not exist "workspace" mkdir "workspace"
 
+if exist "D:\Program Files\Blender Foundation\Blender 5.2\blender.exe" set "BLENDER_PATH=D:\Program Files\Blender Foundation\Blender 5.2\blender.exe"
+if exist "D:\CodingProjects\spacegame\Godot\Godot_v4.6.3-stable_win64_console.exe" set "GODOT_PATH=D:\CodingProjects\spacegame\Godot\Godot_v4.6.3-stable_win64_console.exe"
+set "PATH=%~dp0bin;D:\Program Files\Blender Foundation\Blender 5.2;D:\CodingProjects\spacegame\Godot;%PATH%"
+
 set "PYTHON_EXE=python"
 if exist ".venv\Scripts\python.exe" set "PYTHON_EXE=.venv\Scripts\python.exe"
 

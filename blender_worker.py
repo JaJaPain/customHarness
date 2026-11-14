@@ -298,6 +298,7 @@ class BlenderWorker:
 
         search_roots = [
             Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Blender Foundation",
+            Path(r"D:\Program Files\Blender Foundation"),
             Path(os.environ.get("LOCALAPPDATA", r"C:\Users\Default\AppData\Local"))
             / "Programs"
             / "Blender Foundation",
@@ -312,23 +313,26 @@ class BlenderWorker:
 
         candidates: List[Path] = []
         for root in search_roots:
-            if not root.exists():
+            try:
+                if not root.exists():
+                    continue
+                direct_exe = root / "blender.exe"
+                if direct_exe.exists():
+                    candidates.append(direct_exe)
+                for sub in sorted(root.glob("Blender*"), reverse=True):
+                    exe = sub / "blender.exe"
+                    if exe.exists():
+                        candidates.append(exe)
+            except Exception:
                 continue
-            direct_exe = root / "blender.exe"
-            if direct_exe.exists():
-                candidates.append(direct_exe)
-            for sub in sorted(root.glob("Blender*"), reverse=True):
-                exe = sub / "blender.exe"
-                if exe.exists():
-                    candidates.append(exe)
 
         which_blender = shutil.which("blender") or shutil.which("blender.exe")
         if which_blender:
             candidates.append(Path(which_blender))
 
-        # Prefer Blender 4.x+ first
+        # Prefer Blender 5.x or 4.x+ first
         for cand in candidates:
-            if "4." in str(cand):
+            if "5." in str(cand) or "4." in str(cand):
                 self._cached_blender_path = str(cand.resolve())
                 return self._cached_blender_path
 
