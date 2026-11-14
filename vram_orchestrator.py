@@ -337,6 +337,21 @@ IMAGE_MODELS: Dict[str, Dict[str, Any]] = {
         "filename": "FLUX.1-schnell-Q5_K_S.gguf",
         "hf_url": "https://huggingface.co/city96/FLUX.1-schnell-gguf/resolve/main/flux1-schnell-Q5_K_S.gguf",
         "steps": 4,
+        # FLUX cannot run without its VAE and both text encoders (ungated mirrors)
+        "companions": [
+            {
+                "filename": "ae.safetensors",
+                "hf_url": "https://huggingface.co/Comfy-Org/Lumina_Image_2.0_Repackaged/resolve/main/split_files/vae/ae.safetensors",
+            },
+            {
+                "filename": "clip_l.safetensors",
+                "hf_url": "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors",
+            },
+            {
+                "filename": "t5xxl_q5_k.gguf",
+                "hf_url": "https://huggingface.co/city96/t5-v1_1-xxl-encoder-gguf/resolve/main/t5-v1_1-xxl-encoder-Q5_K_M.gguf",
+            },
+        ],
     },
     "flux-klein": {
         "id": "flux-klein",
@@ -1733,11 +1748,17 @@ class VRAMOrchestrator:
         image_models_status: Dict[str, Any] = {}
         for iid, imod in IMAGE_MODELS.items():
             ipath = self.models_dir / imod["filename"]
+            missing_files = [
+                f for f in [imod["filename"]] + [c["filename"] for c in imod.get("companions", [])]
+                if not (self.models_dir / f).exists()
+            ]
             image_models_status[iid] = {
                 "id": iid,
                 "display_name": imod["display_name"],
                 "path": str(ipath),
-                "exists": ipath.exists(),
+                # Ready only when the VAE / text-encoder companion files are present too
+                "exists": not missing_files,
+                "missing_files": missing_files,
                 "size_mb": round(ipath.stat().st_size / (1024 ** 2), 1) if ipath.exists() else 0,
                 "hf_url": imod["hf_url"],
             }
@@ -2135,6 +2156,16 @@ class VRAMOrchestrator:
                         hf_token=hf_token,
                         progress_cb=progress_cb,
                     )
+                for comp in imod.get("companions", []):
+                    comp_dest = self.models_dir / comp["filename"]
+                    if not (comp_dest.exists() and comp_dest.stat().st_size > 1024 * 1024):
+                        await self._stream_file_download(
+                            job_key=job_key,
+                            url=comp["hf_url"],
+                            dest_path=comp_dest,
+                            hf_token=hf_token,
+                            progress_cb=progress_cb,
+                        )
                 return self._update_download_job(
                     job_key,
                     progress_cb,

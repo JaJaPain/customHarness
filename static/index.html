@@ -100,6 +100,14 @@
     <!-- LEFT SIDEBAR: saved conversations for the active project -->
     <aside id="conversations-pane" class="side-drawer conv-pane">
       <div class="pane-header">
+        <span>PROJECT</span>
+        <button id="btn-new-project" class="mini-btn mini-btn-accent" title="Open or create another Godot project folder">＋ New</button>
+      </div>
+      <div class="project-picker">
+        <select id="project-select" title="Switch to a previously opened project"></select>
+        <div id="project-path-hint" class="project-path-hint"></div>
+      </div>
+      <div class="pane-header">
         <span>CONVERSATIONS</span>
         <button id="btn-new-chat" class="mini-btn mini-btn-accent" title="Start a new conversation for this project">＋ New</button>
       </div>

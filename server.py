@@ -53,7 +53,11 @@ logger = logging.getLogger("CustomHarness.Server")
 
 BASE_DIR = Path(__file__).parent.resolve()
 DEFAULT_WORKSPACE_DIR = BASE_DIR / "workspace"
-WORKSPACE_CONFIG_FILE = BASE_DIR / "cache" / "workspace_config.json"
+# A HARNESS_WORKSPACE_DIR override (tests / throwaway runs) must not rewrite the user's saved project list
+WORKSPACE_CONFIG_FILE = BASE_DIR / "cache" / (
+    "workspace_config.test.json" if os.environ.get("HARNESS_WORKSPACE_DIR") else "workspace_config.json"
+)
+MAX_RECENT_PROJECTS = 20
 STATIC_DIR = BASE_DIR / "static"
 
 
@@ -77,16 +81,59 @@ def _load_persisted_workspace_dir() -> Path:
     return DEFAULT_WORKSPACE_DIR
 
 
-def _save_persisted_workspace_dir(target_dir: Path) -> None:
-    """Persist the user's selected project folder to ./cache/workspace_config.json."""
+def _read_workspace_config() -> Dict[str, Any]:
+    try:
+        if WORKSPACE_CONFIG_FILE.exists():
+            data = json.loads(WORKSPACE_CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception as exc:
+        logger.warning(f"Could not read workspace config: {exc}")
+    return {}
+
+
+def _recent_project_paths(active_dir: Optional[Path] = None) -> List[str]:
+    """Previously opened project folders, most recent first (the active one is always included)."""
+    data = _read_workspace_config()
+    saved = [str(x) for x in data.get("recent_projects", []) if isinstance(x, str) and x.strip()]
+    if "recent_projects" not in data:
+        # First run with this feature: seed with what we know has been opened before
+        saved = [str(x) for x in (data.get("workspace_dir"), str(DEFAULT_WORKSPACE_DIR)) if x]
+    if active_dir is not None:
+        saved.insert(0, str(active_dir.resolve()))
+    seen: set = set()
+    ordered: List[str] = []
+    for raw in saved:
+        key = os.path.normcase(os.path.normpath(raw))
+        if key not in seen:
+            seen.add(key)
+            ordered.append(os.path.normpath(raw))
+    return ordered[:MAX_RECENT_PROJECTS]
+
+
+def _write_workspace_config(active_dir: Path, recent: List[str]) -> None:
     try:
         WORKSPACE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         WORKSPACE_CONFIG_FILE.write_text(
-            json.dumps({"workspace_dir": str(target_dir.resolve())}, indent=2),
+            json.dumps(
+                {"workspace_dir": str(active_dir.resolve()), "recent_projects": recent},
+                indent=2,
+            ),
             encoding="utf-8",
         )
     except Exception as exc:
         logger.warning(f"Could not save workspace config: {exc}")
+
+
+def _save_persisted_workspace_dir(target_dir: Path, previous_dir: Optional[Path] = None) -> None:
+    """Persist the selected project folder and move it to the top of the recent-projects list."""
+    recent = _recent_project_paths(active_dir=target_dir)
+    if previous_dir is not None:
+        # Make sure the project we are leaving stays in the list, whatever way it was opened
+        prev = os.path.normpath(str(previous_dir.resolve()))
+        if os.path.normcase(prev) not in {os.path.normcase(x) for x in recent}:
+            recent.insert(1, prev)
+    _write_workspace_config(target_dir, recent[:MAX_RECENT_PROJECTS])
 
 
 WORKSPACE_DIR = _load_persisted_workspace_dir()
@@ -777,33 +824,119 @@ async def _call_llm(
         "temperature": 0.2,
         "max_tokens": 8192,
     }
+    payload["stream"] = True
+    return await _stream_chat_completion(url, payload, step_index)
+
+
+_STREAM_FLUSH_INTERVAL_SEC = 0.08
+
+
+async def _stream_chat_completion(
+    url: str, payload: Dict[str, Any], step_index: int
+) -> Tuple[str, str, Optional[List[Dict[str, Any]]], str]:
+    """
+    POST a streaming chat completion and forward tokens to the UI as they arrive
+    (`llm_delta` WebSocket events: answer text, reasoning text, and tool-call writing progress).
+    Returns the fully assembled (content, reasoning, tool_calls, finish_reason).
+    """
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    calls: Dict[int, Dict[str, str]] = {}
+    finish_reason = "stop"
+    pending = {"content": "", "reasoning": ""}
+    tool_progress: Optional[Dict[str, Any]] = None
+    last_flush = time.monotonic()
+
+    async def flush(force: bool = False) -> None:
+        nonlocal last_flush, tool_progress
+        now = time.monotonic()
+        if not force and now - last_flush < _STREAM_FLUSH_INTERVAL_SEC:
+            return
+        if not (pending["content"] or pending["reasoning"] or tool_progress):
+            return
+        await ws_manager.broadcast(
+            "llm_delta",
+            {
+                "step": step_index,
+                "content": pending["content"],
+                "reasoning": pending["reasoning"],
+                "tool_progress": tool_progress,
+            },
+        )
+        pending["content"] = ""
+        pending["reasoning"] = ""
+        tool_progress = None
+        last_flush = now
+
     try:
         # Local generation of a long file can take minutes on a 12GB GPU - never time out early.
         async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=10.0)) as client:
-            resp = await client.post(url, json=payload)
+            async with client.stream("POST", url, json=payload) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread()).decode("utf-8", errors="replace")[:800]
+                    if "context" in body.lower() and ("exceed" in body.lower() or "too large" in body.lower()):
+                        raise LLMContextOverflowError(body)
+                    raise LLMUnavailableError(
+                        f"llama-server rejected the request (HTTP {resp.status_code}): {body}"
+                    )
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except Exception:
+                        continue
+                    if chunk.get("error"):
+                        err_text = json.dumps(chunk["error"])[:800]
+                        if "context" in err_text.lower():
+                            raise LLMContextOverflowError(err_text)
+                        raise LLMUnavailableError(f"llama-server reported an error while generating: {err_text}")
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    delta = choice.get("delta") or {}
+                    if delta.get("content"):
+                        content_parts.append(delta["content"])
+                        pending["content"] += delta["content"]
+                    if delta.get("reasoning_content"):
+                        reasoning_parts.append(delta["reasoning_content"])
+                        pending["reasoning"] += delta["reasoning_content"]
+                    for tc_delta in delta.get("tool_calls") or []:
+                        slot = calls.setdefault(int(tc_delta.get("index", 0)), {"id": "", "name": "", "args": ""})
+                        if tc_delta.get("id"):
+                            slot["id"] = tc_delta["id"]
+                        fn = tc_delta.get("function") or {}
+                        if fn.get("name"):
+                            slot["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            slot["args"] += fn["arguments"]
+                        tool_progress = {"name": slot["name"], "chars": len(slot["args"])}
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+                    await flush()
+        await flush(force=True)
+    except (LLMUnavailableError, LLMContextOverflowError):
+        raise
     except Exception as exc:
         raise LLMUnavailableError(
             f"The request to the local model (llama-server on port {orchestrator.llama_port}) failed: "
             f"{type(exc).__name__}: {exc}. {orchestrator.describe_llm_unavailable()}"
         ) from exc
 
-    if resp.status_code != 200:
-        body = resp.text[:800]
-        if "context" in body.lower() and ("exceed" in body.lower() or "too large" in body.lower()):
-            raise LLMContextOverflowError(body)
-        raise LLMUnavailableError(
-            f"llama-server rejected the request (HTTP {resp.status_code}): {body}"
-        )
-
-    data = resp.json()
-    choice = data["choices"][0]
-    message = choice.get("message") or {}
-    return (
-        message.get("content") or "",
-        message.get("reasoning_content") or "",
-        message.get("tool_calls"),
-        choice.get("finish_reason") or "stop",
-    )
+    tool_calls = [
+        {
+            "id": c["id"] or f"call_{uuid.uuid4().hex[:8]}",
+            "type": "function",
+            "function": {"name": c["name"], "arguments": c["args"] or "{}"},
+        }
+        for _, c in sorted(calls.items())
+        if c["name"]
+    ]
+    return "".join(content_parts), "".join(reasoning_parts), (tool_calls or None), finish_reason
 
 
 # =============================================================================
@@ -934,6 +1067,7 @@ async def _run_agent_turn_locked(
     vision_self_checks: List[Dict[str, Any]] = []
     overflow_triggered = False
     compacted_for_overflow = False
+    nudged_after_cutoff = False
     error_text: Optional[str] = None
     hit_step_limit = False
 
@@ -989,7 +1123,8 @@ async def _run_agent_turn_locked(
             all_thinking_traces.append(f"[Step {step_idx}]\n{step_thinking}")
         if step_reply:
             all_clean_replies.append(step_reply)
-        if finish_reason == "length" and not tool_calls:
+        cut_off = finish_reason == "length" and not tool_calls
+        if cut_off and nudged_after_cutoff:
             all_clean_replies.append(
                 "_(The model's output was cut off at the token limit. Say \"continue\" to let it carry on.)_"
             )
@@ -1009,6 +1144,22 @@ async def _run_agent_turn_locked(
                 for tc in tool_calls
             ]
         CONVERSATION_HISTORY.append(assistant_msg)
+
+        if cut_off and not nudged_after_cutoff:
+            # The model ran out of tokens mid-thought (usually over-long reasoning): nudge it once to act
+            nudged_after_cutoff = True
+            CONVERSATION_HISTORY.append(
+                {
+                    "role": "user",
+                    "synthetic": True,
+                    "content": (
+                        "[Automatic notice] Your previous output hit the length limit before you called a tool "
+                        "or finished. Continue now: keep your reasoning to a few sentences and make the next "
+                        "tool call (or give the final answer) immediately."
+                    ),
+                }
+            )
+            continue
 
         # No tool calls -> the model has given its final answer for this turn
         if not tool_calls:
@@ -1446,6 +1597,53 @@ def _require_idle() -> None:
         raise HTTPException(status_code=409, detail="The agent is still working. Wait for it to finish first.")
 
 
+class ProjectPathRequest(BaseModel):
+    path: str
+
+
+def _projects_payload() -> Dict[str, Any]:
+    active = tool_executor.workspace_dir
+    active_key = os.path.normcase(os.path.normpath(str(active)))
+    projects: List[Dict[str, Any]] = []
+    for raw in _recent_project_paths(active_dir=active):
+        folder = Path(raw)
+        exists = folder.is_dir()
+        conv_count = 0
+        if exists:
+            try:
+                conv_count = len(list((folder / ".harness" / "conversations").glob("*.json")))
+            except Exception:
+                pass
+        projects.append(
+            {
+                "path": raw,
+                "name": folder.name or raw,
+                "exists": exists,
+                "active": os.path.normcase(raw) == active_key,
+                "conversation_count": conv_count,
+            }
+        )
+    return {"active_path": str(active), "projects": projects}
+
+
+@app.get("/api/projects")
+async def api_projects() -> Dict[str, Any]:
+    """Previously opened project folders for the Projects dropdown."""
+    return _projects_payload()
+
+
+@app.post("/api/projects/forget")
+async def api_projects_forget(req: ProjectPathRequest) -> Dict[str, Any]:
+    """Remove a folder from the recent-projects list (nothing on disk is deleted)."""
+    key = os.path.normcase(os.path.normpath(req.path))
+    active = tool_executor.workspace_dir
+    if key == os.path.normcase(os.path.normpath(str(active))):
+        raise HTTPException(status_code=400, detail="Cannot remove the project that is currently open.")
+    remaining = [x for x in _recent_project_paths(active_dir=active) if os.path.normcase(x) != key]
+    _write_workspace_config(active, remaining)
+    return _projects_payload()
+
+
 @app.get("/api/chat/history")
 async def api_chat_history() -> Dict[str, Any]:
     """Open conversation + the list of saved conversations for the active project."""
@@ -1650,6 +1848,7 @@ async def _apply_workspace_folder_switch(
     target_path: Path, init_starter_if_empty: bool = False
 ) -> Dict[str, Any]:
     global WORKSPACE_DIR
+    _require_idle()  # never swap the project out from under a running agent turn
     target_path = target_path.resolve()
     target_path.mkdir(parents=True, exist_ok=True)
 
@@ -1671,8 +1870,9 @@ async def _apply_workspace_folder_switch(
 
     # Each project folder keeps its own conversation: save the outgoing one, load the incoming one
     _persist_history()
+    previous_dir = tool_executor.workspace_dir
     WORKSPACE_DIR = target_path
-    _save_persisted_workspace_dir(target_path)
+    _save_persisted_workspace_dir(target_path, previous_dir=previous_dir)
     tool_executor.set_workspace_dir(target_path)
     await orchestrator.switch_session(
         conversation_id=orchestrator.conversation_id,

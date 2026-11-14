@@ -20,7 +20,9 @@ integrated into the `VRAMOrchestrator` hot-swap pipeline:
 from __future__ import annotations
 
 import base64
+import asyncio
 import gc
+import os
 import hashlib
 import io
 import logging
@@ -153,7 +155,7 @@ class AudioGenWorker:
 
         try:
             # Step C: Attempt `stabilityai/stable-audio-open-1.0` via diffusers StableAudioPipeline in FP16
-            raw_stereo, used_engine = self._run_stable_audio_pipeline_or_fallback(
+            gen_kwargs = dict(
                 prompt=conditioned_prompt,
                 negative_prompt=negative_prompt,
                 mode=mode_clean,
@@ -162,6 +164,13 @@ class AudioGenWorker:
                 cfg_scale=cfg_scale,
                 seed=seed,
             )
+            if os.environ.get("HARNESS_SCRIPTED_DEMO") == "1":
+                raw_stereo, used_engine = self._run_stable_audio_pipeline_or_fallback(**gen_kwargs)
+            else:
+                # Diffusion takes a while: run it off the event loop so the UI keeps updating
+                raw_stereo, used_engine = await asyncio.to_thread(
+                    self._run_stable_audio_pipeline_or_fallback, **gen_kwargs
+                )
         finally:
             # Step D: Ensure GPU memory is freed before relaunching llama-server.exe
             self._release_torch_cuda_cache()
@@ -294,78 +303,81 @@ class AudioGenWorker:
         in FP16 on CUDA if local weights and libraries are present.
         Otherwise synthesize deterministic 44.1 kHz stereo audio on CPU/NumPy.
         """
+        if os.environ.get("HARNESS_SCRIPTED_DEMO") == "1":
+            # Scripted test mode only: deterministic DSP tones stand in for the model
+            stereo = self._synthesize_procedural_game_audio(
+                prompt=prompt, mode=mode, duration_sec=duration_sec, seed=seed
+            )
+            return stereo, "procedural_44k1_stereo_dsp (scripted demo)"
+
+        # Real generation only. Any problem is raised with a clear reason - never replaced by fake audio.
         local_model_dir = self.orchestrator.models_dir / "stable-audio-open-1.0"
-        hf_cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
-        has_cached_weights = (
-            local_model_dir.exists()
-            or (hf_cache_dir.exists() and any(hf_cache_dir.glob("*stable-audio-open-1.0*")))
+        if not (local_model_dir / "model_index.json").exists():
+            raise RuntimeError(
+                "Audio generation is not installed yet: the Stable Audio Open 1.0 weights are missing from "
+                f"{local_model_dir}. Open Setup / Downloads to install them."
+            )
+        try:
+            import torch  # type: ignore
+            from diffusers import StableAudioPipeline  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "Audio generation needs the Python packages `torch` (CUDA build) and `diffusers` "
+                f"({type(exc).__name__}: {exc}). Install them into the harness .venv."
+            ) from exc
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "Audio generation needs a CUDA build of PyTorch, but this Python has a CPU-only build "
+                f"(torch {torch.__version__}). Install the CUDA wheel into the harness .venv."
+            )
+
+        logger.info(f"Loading StableAudioPipeline ({local_model_dir}) in FP16 on CUDA...")
+        pipe = StableAudioPipeline.from_pretrained(
+            str(local_model_dir),
+            torch_dtype=torch.float16,
+            local_files_only=True,
         )
-
-        if has_cached_weights:
-            try:
-                import torch  # type: ignore
-                from diffusers import StableAudioPipeline  # type: ignore
-
-                if torch.cuda.is_available():
-                    model_source = (
-                        str(local_model_dir) if local_model_dir.exists() else self.MODEL_REPO_ID
-                    )
-                    logger.info(
-                        f"Loading StableAudioPipeline ({model_source}) in FP16 on CUDA..."
-                    )
-                    pipe = StableAudioPipeline.from_pretrained(
-                        model_source,
-                        torch_dtype=torch.float16,
-                        local_files_only=True,
-                    )
-                    pipe = pipe.to("cuda")
-
-                    actual_seed = seed if seed >= 0 else int(time.time() * 1000) % (2**31 - 1)
-                    generator = torch.Generator("cuda").manual_seed(actual_seed)
-
-                    with torch.inference_mode():
-                        result = pipe(
-                            prompt=prompt,
-                            negative_prompt=negative_prompt,
-                            num_inference_steps=max(10, min(150, int(steps))),
-                            guidance_scale=float(cfg_scale),
-                            audio_end_in_s=float(duration_sec),
-                            num_waveforms_per_prompt=1,
-                            generator=generator,
-                        )
-                        # result.audios has shape (batch, channels, samples) at pipe.vae.sampling_rate (44100 Hz)
-                        audio_tensor = result.audios[0].detach().cpu().float().numpy()
-                        orig_sr = int(getattr(pipe.vae, "sampling_rate", self.SAMPLE_RATE_HZ))
-
-                    # Cleanly unload pipeline from VRAM before returning
-                    pipe.to("cpu")
-                    del pipe
-                    del result
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
-                    if audio_tensor.ndim == 1:
-                        audio_tensor = np.vstack([audio_tensor, audio_tensor])
-                    elif audio_tensor.shape[0] > 2:
-                        audio_tensor = audio_tensor[:2, :]
-                    elif audio_tensor.shape[0] == 1:
-                        audio_tensor = np.vstack([audio_tensor, audio_tensor])
-
-                    if orig_sr != self.SAMPLE_RATE_HZ:
-                        audio_tensor = self._resample_stereo(
-                            audio_tensor, orig_sr=orig_sr, target_sr=self.SAMPLE_RATE_HZ
-                        )
-
-                    return audio_tensor.astype(np.float32), "diffusers_stable_audio_open_fp16"
-            except Exception as exc:
-                logger.warning(
-                    f"StableAudioPipeline FP16 execution unavailable ({exc}); using procedural 44.1kHz stereo DSP synthesis."
+        try:
+            pipe = pipe.to("cuda")
+            actual_seed = seed if seed >= 0 else int(time.time() * 1000) % (2**31 - 1)
+            generator = torch.Generator("cuda").manual_seed(actual_seed)
+            with torch.inference_mode():
+                result = pipe(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    num_inference_steps=max(10, min(150, int(steps))),
+                    guidance_scale=float(cfg_scale),
+                    audio_end_in_s=float(duration_sec),
+                    num_waveforms_per_prompt=1,
+                    generator=generator,
                 )
+                # result.audios has shape (batch, channels, samples) at pipe.vae.sampling_rate (44100 Hz)
+                audio_tensor = result.audios[0].detach().cpu().float().numpy()
+                orig_sr = int(getattr(pipe.vae, "sampling_rate", self.SAMPLE_RATE_HZ))
+            del result
+        finally:
+            # Always release VRAM so llama-server can be reloaded
+            try:
+                pipe.to("cpu")
+            except Exception:
+                pass
+            del pipe
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        stereo = self._synthesize_procedural_game_audio(
-            prompt=prompt, mode=mode, duration_sec=duration_sec, seed=seed
-        )
-        return stereo, "procedural_44k1_stereo_dsp (stable-audio-open-1.0 fallback)"
+        if audio_tensor.ndim == 1:
+            audio_tensor = np.vstack([audio_tensor, audio_tensor])
+        elif audio_tensor.shape[0] > 2:
+            audio_tensor = audio_tensor[:2, :]
+        elif audio_tensor.shape[0] == 1:
+            audio_tensor = np.vstack([audio_tensor, audio_tensor])
+
+        if orig_sr != self.SAMPLE_RATE_HZ:
+            audio_tensor = self._resample_stereo(
+                audio_tensor, orig_sr=orig_sr, target_sr=self.SAMPLE_RATE_HZ
+            )
+
+        return audio_tensor.astype(np.float32), "diffusers_stable_audio_open_fp16"
 
     @staticmethod
     def _release_torch_cuda_cache() -> None:

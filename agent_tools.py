@@ -286,11 +286,24 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "function": {
             "name": "run_blender_script",
             "description": (
-                "Run a headless Blender 4.x Python (bpy) script wrapped inside the Godot 4 Export Harness. "
-                "Automatically applies all transforms, enforces 1.0m metric units, converts Z-up to glTF +Y up, "
-                "preserves Godot collision suffixes (-col, -colonly, -convcol, -noimp), exports binary .glb + "
-                "blend_src/.blend, and renders a 3-Angle Visual Verification Contact Sheet (Front -Y, 3/4 Iso, "
-                "Wireframe/Top) injected into your vision input."
+                "Build a 3D model with a headless Blender Python (bpy) script and export it as a .glb for Godot. "
+                "Your script ONLY creates mesh objects. The harness starts from an empty scene and afterwards "
+                "applies transforms, exports the .glb, saves the .blend and renders a 3-angle preview image you "
+                "will see - so do NOT clear the scene, add cameras or lights, touch the world, render or export.\n"
+                "These helpers are already defined - USE THEM instead of writing material node code:\n"
+                "  make_material(name, (r, g, b), roughness=0.8, metallic=0.0) -> material\n"
+                "  add_box(name, (size_x, size_y, size_z), location=(x, y, z), material=mat, rotation=(rx, ry, rz) degrees)\n"
+                "  add_cylinder(name, radius, depth, location=(x, y, z), material=mat, rotation=(rx, ry, rz))\n"
+                "  add_sphere(name, radius, location=(x, y, z), material=mat)\n"
+                "Example - a 1 m wooden crate with darker trim:\n"
+                "  wood = make_material('Wood', (0.55, 0.36, 0.18))\n"
+                "  trim = make_material('Trim', (0.30, 0.19, 0.09))\n"
+                "  add_box('Crate', (1.0, 1.0, 1.0), location=(0, 0, 0.5), material=wood)\n"
+                "  add_box('TrimTop', (1.04, 1.04, 0.08), location=(0, 0, 0.98), material=trim)\n"
+                "Units are metres, Z is up, put the model's base at z=0. Build shapes from several boxes / "
+                "cylinders / spheres. Name a mesh with the suffix -col or -colonly to make Godot generate "
+                "collision from it. Raw bpy is allowed but its API differs between Blender versions. "
+                "If the script errors you get the Python traceback: fix that line and call again."
             ),
             "parameters": {
                 "type": "object",
@@ -778,8 +791,26 @@ class AgentToolExecutor:
             }
         return self.memory_rag.recall_memory(query=query, top_k=top_k)
 
+    # Harness bookkeeping (saved chats, backups, Godot's import cache) is not project content.
+    # Letting the model browse it only derails it, so the file tools treat it as non-existent.
+    _INTERNAL_DIR_NAMES = (".harness", ".harness_backups", ".godot", "__pycache__", ".git")
+
+    def _is_internal_path(self, target: Path) -> bool:
+        try:
+            parts = target.resolve().relative_to(self.workspace_dir).parts
+        except ValueError:
+            parts = target.parts
+        return any(part in self._INTERNAL_DIR_NAMES for part in parts)
+
+    _INTERNAL_PATH_ERROR = (
+        "That path is internal harness/engine bookkeeping, not part of the game project. "
+        "Work only with the project's scenes, scripts and assets."
+    )
+
     def tool_list_dir(self, path: str = ".", recursive: bool = False) -> Dict[str, Any]:
         target = self.resolve_workspace_path(path)
+        if self._is_internal_path(target):
+            return {"status": "error", "error": self._INTERNAL_PATH_ERROR}
         if not target.exists():
             return {"status": "error", "error": f"Directory not found: {path}"}
         if not target.is_dir():
@@ -788,7 +819,7 @@ class AgentToolExecutor:
         entries: List[Dict[str, Any]] = []
         iterator = target.rglob("*") if recursive else target.iterdir()
         for item in sorted(iterator, key=lambda p: (not p.is_dir(), p.name.lower())):
-            if any(part.startswith(".harness_backups") or part == "__pycache__" for part in item.parts):
+            if self._is_internal_path(item):
                 continue
             rel = self.to_res_path(item)
             entries.append(
@@ -816,6 +847,8 @@ class AgentToolExecutor:
         self, path: str, start_line: int = 1, end_line: int = 250
     ) -> Dict[str, Any]:
         target = self.resolve_workspace_path(path)
+        if self._is_internal_path(target):
+            return {"status": "error", "error": self._INTERNAL_PATH_ERROR}
         if not target.exists() or not target.is_file():
             return {"status": "error", "error": f"File not found: {path}"}
 

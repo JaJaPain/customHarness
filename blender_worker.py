@@ -75,6 +75,55 @@ scene.unit_settings.system = 'METRIC'
 scene.unit_settings.scale_length = 1.0
 scene.unit_settings.length_unit = 'METERS'
 
+# 1b. Helpers available to the agent script (correct for Blender 4.x and 5.x)
+def make_material(name, color, roughness=0.8, metallic=0.0):
+    """Solid-colour PBR material that shows in the preview AND exports to glTF. color = (r, g, b) or (r, g, b, a), 0..1."""
+    c = tuple(float(v) for v in color)
+    c = c + (1.0,) if len(c) == 3 else c[:4]
+    mat = bpy.data.materials.new(name)
+    try:
+        mat.use_nodes = True
+    except Exception:
+        pass
+    mat.diffuse_color = c
+    bsdf = None
+    if mat.node_tree:
+        bsdf = next((n for n in mat.node_tree.nodes if n.bl_idname == 'ShaderNodeBsdfPrincipled'), None)
+    if bsdf:
+        bsdf.inputs['Base Color'].default_value = c
+        bsdf.inputs['Roughness'].default_value = float(roughness)
+        bsdf.inputs['Metallic'].default_value = float(metallic)
+    return mat
+
+
+def _finish_object(name, material, rotation):
+    obj = bpy.context.active_object
+    obj.name = name
+    if rotation:
+        obj.rotation_euler = tuple(math.radians(a) for a in rotation)
+    if material is not None:
+        obj.data.materials.append(material)
+    return obj
+
+
+def add_box(name, size, location=(0, 0, 0), material=None, rotation=None):
+    """Box with size = (x, y, z) in metres centred at location. rotation in degrees."""
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=tuple(location))
+    bpy.context.active_object.scale = tuple(size)
+    return _finish_object(name, material, rotation)
+
+
+def add_cylinder(name, radius, depth, location=(0, 0, 0), material=None, rotation=None, segments=24):
+    """Cylinder along Z (rotate with rotation=(90, 0, 0) etc., degrees)."""
+    bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=depth, vertices=segments, location=tuple(location))
+    return _finish_object(name, material, rotation)
+
+
+def add_sphere(name, radius, location=(0, 0, 0), material=None):
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=radius, location=tuple(location))
+    return _finish_object(name, material, None)
+
+
 # 2. Execute Agent Procedural bpy Script
 # ==================== BEGIN AGENT SCRIPT ====================
 __AGENT_SCRIPT_CODE__
@@ -475,15 +524,32 @@ class BlenderWorker:
         script_file.write_text(wrapped_code, encoding="utf-8")
 
         # Also save the wrapped script alongside the .blend in blend_src/ for reproducibility
+        # (only the agent's own script: the export wrapper around it is harness plumbing, not something to edit)
         saved_script_path = blend_abs.with_suffix(".bpy.py")
-        saved_script_path.write_text(wrapped_code, encoding="utf-8")
+        saved_script_path.write_text(script_code, encoding="utf-8")
 
         stdout_text = ""
         metadata: Dict[str, Any] = {}
         engine_used = "blender-headless-cli"
+        scripted_demo = os.environ.get("HARNESS_SCRIPTED_DEMO") == "1"
+        blender_available = bool(blender_exe and Path(blender_exe).exists())
+        failure_reason: Optional[str] = None
+
+        # Remove any previous export so a failed run can never be mistaken for a fresh model
+        for stale in (glb_abs, contact_sheet_abs):
+            try:
+                if stale.exists():
+                    stale.unlink()
+            except Exception:
+                pass
 
         try:
-            if blender_exe and Path(blender_exe).exists():
+            if not blender_available and not scripted_demo:
+                failure_reason = (
+                    "Blender was not found on this machine. Install Blender 4.x+ or set BLENDER_PATH, "
+                    "then try again."
+                )
+            if blender_available:
                 cmd = [
                     blender_exe,
                     "-b",
@@ -518,8 +584,24 @@ class BlenderWorker:
                         except Exception:
                             pass
 
+                if not glb_abs.exists() or proc.returncode != 0:
+                    failure_reason = self._summarize_blender_failure(stdout_text, proc.returncode)
+
+            if failure_reason and not scripted_demo:
+                # Real use: report the script error so the model can fix it. No stand-in cube.
+                return {
+                    "status": "error",
+                    "tool": "run_blender_script",
+                    "error": failure_reason,
+                    "res_glb_path": self.to_res_path(glb_abs),
+                    "hint": (
+                        "Fix the Python error above and call run_blender_script again. Do not clear the "
+                        "scene or export yourself: the harness starts from an empty scene and exports the .glb."
+                    ),
+                }
+
             if not glb_abs.exists():
-                # Fallback mesh & glTF 2.0 binary synthesizer when Blender is not installed on host
+                # Scripted test mode only: procedural stand-in mesh when Blender is unavailable
                 metadata = self._fallback_generate_glb_and_views(
                     script_code=script_code,
                     glb_abs=glb_abs,
@@ -596,6 +678,22 @@ class BlenderWorker:
             "elapsed_seconds": elapsed_sec,
             "blender_logs_tail": stdout_text[-800:] if stdout_text else "",
         }
+
+    @staticmethod
+    def _summarize_blender_failure(stdout_text: str, returncode: Optional[int]) -> str:
+        """Pull the Python traceback (or last lines) out of Blender's log for the model to act on."""
+        lines = [ln.rstrip() for ln in (stdout_text or "").splitlines() if ln.strip()]
+        start = None
+        for i, ln in enumerate(lines):
+            if ln.startswith("Traceback (most recent call last)") or "SyntaxError" in ln or ln.lstrip().startswith("File \""):
+                start = i
+                break
+        excerpt = lines[start : start + 25] if start is not None else lines[-15:]
+        # Line numbers refer to the wrapped harness file; the agent script starts ~80 lines in
+        return (
+            f"The Blender script failed (exit code {returncode}) and no .glb was exported.\n"
+            + "\n".join(excerpt)
+        )
 
     # -------------------------------------------------------------------------
     # 3-Angle Visual Verification Contact Sheet Composer

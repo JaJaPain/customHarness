@@ -26,7 +26,57 @@ window.addEventListener("DOMContentLoaded", async () => {
   ]);
   const newChatBtn = document.getElementById("btn-new-chat");
   if (newChatBtn) newChatBtn.addEventListener("click", startNewChat);
+  const newProjectBtn = document.getElementById("btn-new-project");
+  if (newProjectBtn) newProjectBtn.addEventListener("click", () => openFolderModal());
+  const projectSelect = document.getElementById("project-select");
+  if (projectSelect) projectSelect.addEventListener("change", () => switchProject(projectSelect.value));
+  loadProjects();
 });
+
+// ============================================================================
+// Projects dropdown (previously opened project folders)
+// ============================================================================
+async function loadProjects() {
+  const select = document.getElementById("project-select");
+  if (!select) return;
+  try {
+    const res = await fetch("/api/projects");
+    const data = await res.json();
+    select.innerHTML = (data.projects || [])
+      .map((pr) => {
+        const label = `${pr.name}${pr.exists ? "" : " (missing)"}${pr.conversation_count ? ` · ${pr.conversation_count} chat${pr.conversation_count > 1 ? "s" : ""}` : ""}`;
+        return `<option value="${escapeHtml(pr.path)}" title="${escapeHtml(pr.path)}" ${pr.active ? "selected" : ""} ${pr.exists ? "" : "disabled"}>${escapeHtml(label)}</option>`;
+      })
+      .join("");
+    const hint = document.getElementById("project-path-hint");
+    if (hint) {
+      hint.textContent = data.active_path || "";
+      hint.title = data.active_path || "";
+    }
+  } catch (err) {
+    console.error("Could not load projects:", err);
+  }
+}
+
+async function switchProject(folderPath) {
+  if (!folderPath) return;
+  try {
+    const res = await fetch("/api/workspace/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folder_path: folderPath, init_starter_if_empty: false }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(data.detail || "Could not switch project.");
+    }
+  } catch (err) {
+    console.error("Project switch failed:", err);
+  }
+  // The server broadcasts workspace_changed (files, diffs, conversations reload); refresh the picker either way
+  await loadProjects();
+  await loadChatHistory();
+}
 
 // ============================================================================
 // Conversations sidebar (saved chats per project folder)
@@ -159,6 +209,8 @@ function initWebSocket() {
         updateTelemetryUI(msg.data);
       } else if (msg.type === "step_start") {
         handleLiveStepStart(msg.data);
+      } else if (msg.type === "llm_delta") {
+        handleLiveLlmDelta(msg.data);
       } else if (msg.type === "llm_status") {
         const statusHeader = document.getElementById("active-progress-header");
         if (statusHeader && msg.data?.message) statusHeader.textContent = msg.data.message;
@@ -175,6 +227,7 @@ function initWebSocket() {
         loadWorkspaceTree();
         loadDiffHistory();
         loadChatHistory();
+        loadProjects();
       }
     } catch (err) {
       console.error("WS parse error:", err);
@@ -1107,6 +1160,46 @@ function describeToolAction(toolName, args = {}, targetHint = "") {
   };
 }
 
+// Live token stream from the model (answer text, reasoning, and tool-call writing progress)
+function handleLiveLlmDelta(data) {
+  if (!data) return;
+  const card = document.getElementById("active-progress-card");
+  if (!card) return;
+  const textEl = document.getElementById("live-stream-text");
+  const thinkEl = document.getElementById("live-stream-thinking");
+  const statusHeader = document.getElementById("active-progress-header");
+
+  if (data.reasoning && thinkEl) {
+    if (thinkEl.dataset.step !== String(data.step)) {
+      thinkEl.dataset.step = String(data.step);
+      thinkEl.textContent = "";
+    }
+    thinkEl.classList.remove("hidden");
+    thinkEl.textContent += data.reasoning;
+    thinkEl.scrollTop = thinkEl.scrollHeight;
+    if (statusHeader) statusHeader.textContent = `Step ${data.step}: thinking...`;
+  }
+  if (data.content && textEl) {
+    if (textEl.dataset.step && textEl.dataset.step !== String(data.step) && textEl.textContent) {
+      textEl.textContent += "\n\n";
+    }
+    textEl.dataset.step = String(data.step);
+    textEl.classList.remove("hidden");
+    textEl.textContent += data.content;
+    if (thinkEl) thinkEl.classList.add("hidden");
+    if (statusHeader) statusHeader.textContent = `Step ${data.step}: writing reply...`;
+  }
+  if (data.tool_progress && statusHeader) {
+    const tp = data.tool_progress;
+    statusHeader.textContent = `Step ${data.step}: preparing ${tp.name || "tool call"} (${tp.chars.toLocaleString()} chars)...`;
+  }
+  // Follow the stream only if the user is already near the bottom
+  const stream = document.getElementById("chat-stream");
+  if (stream && stream.scrollHeight - stream.scrollTop - stream.clientHeight < 160) {
+    stream.scrollTop = stream.scrollHeight;
+  }
+}
+
 function handleLiveStepStart(data) {
   const statusHeader = document.getElementById("active-progress-header");
   const sendBtn = document.getElementById("btn-send");
@@ -1218,7 +1311,9 @@ async function sendChatPrompt(promptText, simulateContextTokens = null) {
       <span class="msg-role" style="color:#60a5fa;">● WORKING</span>
       <span class="msg-meta" id="active-progress-header">Initializing step 1...</span>
     </div>
+    <div id="live-stream-text" class="msg-body live-stream-text hidden"></div>
     <div id="active-progress-list" class="process-list"></div>
+    <div id="live-stream-thinking" class="live-stream-thinking hidden"></div>
   `;
   stream.appendChild(progressCard);
   progressCard.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -1679,10 +1774,26 @@ function escapeHtml(str) {
 
 function formatMarkdownLite(text) {
   let html = escapeHtml(text);
+  // Protect fenced code blocks from the other rules
+  const codeBlocks = [];
   html = html.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
-    return `<pre class="code-viewer" style="margin-top:8px; border-radius:5px;">${code}</pre>`;
+    codeBlocks.push(`<pre class="code-viewer" style="margin-top:8px; border-radius:5px;">${code}</pre>`);
+    return `\u0000CODE${codeBlocks.length - 1}\u0000`;
   });
+  // Tables: consecutive lines that start with "|"
+  html = html.replace(/(^\|.*\|[ \t]*$\n?){2,}/gm, (block) => {
+    const rows = block.trim().split("\n").map((r) => r.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim()));
+    const isSep = (r) => r.every((c) => /^:?-{2,}:?$/.test(c));
+    const hasHeader = rows.length > 1 && isSep(rows[1]);
+    const body = rows.filter((r, i) => !(isSep(r) && i === 1));
+    const cells = body
+      .map((r, i) => `<tr>${r.map((c) => (hasHeader && i === 0 ? `<th>${c}</th>` : `<td>${c}</td>`)).join("")}</tr>`)
+      .join("");
+    return `<table class="md-table">${cells}</table>`;
+  });
+  html = html.replace(/^(#{1,6})\s+(.+)$/gm, (_, hashes, title) => `<div class="md-h md-h${hashes.length}">${title}</div>`);
   html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
   html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/\u0000CODE(\d+)\u0000/g, (_, i) => codeBlocks[Number(i)]);
   return html;
 }

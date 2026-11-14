@@ -105,21 +105,50 @@ class ImageGenWorker:
             "--sampling-method",
             "euler",
             "--vae-tiling",
+            # Keep each component (T5 / CLIP / FLUX / VAE) in system RAM and move it into VRAM only
+            # while it is needed, so the 8 GB FLUX model + 3.4 GB T5 fit a 12 GB card.
+            "--offload-to-cpu",
             "-s",
             str(seed),
         ]
 
-        # Optional clip_l / t5xxl / vae if present in models_dir
-        for flag, fname in (
-            ("--vae", "ae.safetensors"),
-            ("--clip_l", "clip_l.safetensors"),
-            ("--t5xxl", "t5xxl_q5_k.gguf"),
-        ):
+        # FLUX needs its VAE and both text encoders alongside the diffusion model
+        for flag, fname in self.FLUX_COMPANION_FILES:
             aux = self.orchestrator.models_dir / fname
             if aux.exists():
                 cmd.extend([flag, str(aux)])
 
         return cmd
+
+    FLUX_COMPANION_FILES = (
+        ("--vae", "ae.safetensors"),
+        ("--clip_l", "clip_l.safetensors"),
+        ("--t5xxl", "t5xxl_q5_k.gguf"),
+    )
+
+    @staticmethod
+    def _scripted_demo_enabled() -> bool:
+        return os.environ.get("HARNESS_SCRIPTED_DEMO") == "1"
+
+    def describe_missing_requirements(self) -> Optional[str]:
+        """Return a human-readable reason real image generation cannot run, or None if everything is present."""
+        sd_exe = self.orchestrator.get_sd_binary_path()
+        img_model_info = IMAGE_MODELS[self.orchestrator.active_image_model_id]
+        models_dir = self.orchestrator.models_dir
+        missing: List[str] = []
+        if not sd_exe.exists():
+            missing.append(f"stable-diffusion.cpp binary ({sd_exe.name}) in bin/")
+        if not (models_dir / img_model_info["filename"]).exists():
+            missing.append(f"{img_model_info['filename']} in models/")
+        for _flag, fname in self.FLUX_COMPANION_FILES:
+            if not (models_dir / fname).exists():
+                missing.append(f"{fname} in models/")
+        if missing:
+            return (
+                "Image generation is not installed yet. Missing: " + "; ".join(missing)
+                + ". Open Setup / Downloads to install them."
+            )
+        return None
 
     async def generate_2d_asset(
         self,
@@ -166,13 +195,22 @@ class ImageGenWorker:
 
         engine_used = "stable-diffusion.cpp (CUDA)"
         sd_stdout = ""
+        bg_removal_method = None
+        pbr_files: Dict[str, str] = {}
         try:
-            # Step C: Execute sd.exe if binary & model exist on disk; otherwise procedural fallback
+            # Step C: run the real stable-diffusion.cpp. The procedural synthesizer is only used by the
+            # scripted test mode; in normal use a failure is reported, never papered over with fake art.
             sd_exe = self.orchestrator.get_sd_binary_path()
             img_model_info = IMAGE_MODELS[self.orchestrator.active_image_model_id]
             model_path = self.orchestrator.models_dir / img_model_info["filename"]
+            missing_reason = self.describe_missing_requirements()
 
-            if sd_exe.exists() and model_path.exists():
+            if missing_reason and not self._scripted_demo_enabled():
+                raise RuntimeError(missing_reason)
+
+            if not missing_reason:
+                if out_file.exists():
+                    out_file.unlink()  # never mistake a stale file for a fresh result
                 creationflags = (
                     subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
                 )
@@ -183,11 +221,31 @@ class ImageGenWorker:
                     stderr=asyncio.subprocess.STDOUT,
                     creationflags=creationflags,
                 )
-                stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=180.0)
+                self.orchestrator._sd_process = proc  # lets the orchestrator stop it on shutdown
+                try:
+                    stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=900.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    raise RuntimeError("stable-diffusion.cpp did not finish within 15 minutes and was stopped.")
+                finally:
+                    self.orchestrator._sd_process = None
                 sd_stdout = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+                try:
+                    # Full log of the last run, for diagnosing speed or failures
+                    (self.orchestrator.logs_dir / "sd_last_run.log").write_text(
+                        sd_stdout.replace(chr(13), chr(10)), encoding="utf-8"
+                    )
+                except Exception:
+                    pass
                 if proc.returncode != 0 or not out_file.exists():
+                    if not self._scripted_demo_enabled():
+                        tail = "\n".join(sd_stdout.strip().splitlines()[-12:])
+                        raise RuntimeError(
+                            f"stable-diffusion.cpp failed (exit code {proc.returncode}) and produced no image. "
+                            f"Last output:\n{tail}"
+                        )
                     logger.warning(
-                        f"sd.exe exited with code {proc.returncode}; falling back to procedural synthesis."
+                        f"sd.exe exited with code {proc.returncode}; scripted demo uses procedural synthesis."
                     )
                     self._synthesize_procedural_image(
                         prompt=prompt,
@@ -216,12 +274,10 @@ class ImageGenWorker:
                 self._enforce_seamless_edges(out_file)
 
             # Optional local background removal (rembg / alpha-key)
-            bg_removal_method = None
             if transparent_bg and out_file.exists():
                 bg_removal_method = self._remove_background(out_file)
 
             # Optional PBR Normal / Roughness / Heightmap + Godot StandardMaterial3D .tres
-            pbr_files: Dict[str, str] = {}
             if generate_pbr_maps and out_file.exists():
                 pbr_files = self.generate_pbr_maps_from_albedo(out_file)
 
