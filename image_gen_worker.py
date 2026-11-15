@@ -176,6 +176,12 @@ class ImageGenWorker:
         start_time = time.monotonic()
         asset_type = asset_type if asset_type in ASSET_TYPE_PROMPTS else "sprite"
         enhanced_prompt = f"{prompt.strip()}, {ASSET_TYPE_PROMPTS[asset_type]}"
+        if transparent_bg:
+            # Background removal keys out a flat colour, so ask the model for one explicitly
+            enhanced_prompt = (
+                enhanced_prompt.replace("clean dark background, ", "").replace("isolated background, ", "")
+                + ", single object isolated on a plain flat solid white background, no shadow, no gradient, no frame"
+            )
         out_file = self.resolve_output_path(output_path)
 
         # Step A & Step B: Acquire VRAM via Orchestrator
@@ -276,6 +282,7 @@ class ImageGenWorker:
             # Optional local background removal (rembg / alpha-key)
             if transparent_bg and out_file.exists():
                 bg_removal_method = self._remove_background(out_file)
+                self._trim_to_content(out_file)
 
             # Optional PBR Normal / Roughness / Heightmap + Godot StandardMaterial3D .tres
             if generate_pbr_maps and out_file.exists():
@@ -348,28 +355,65 @@ class ImageGenWorker:
         except Exception as exc:
             logger.debug(f"rembg unavailable or offline ({exc}); using local alpha-key segmentation.")
 
-        # Local corner-sampled flood/chroma distance alpha-key removal
+        # Local background removal: key out the flat border colour, but only where it is
+        # connected to the image edge, so same-coloured details inside the object survive.
         arr = np.array(img, dtype=np.float32)
         rgb = arr[:, :, :3]
-        # Sample background color from the 4 corners (8x8 patches)
-        corners = np.concatenate(
-            [
-                rgb[:8, :8].reshape(-1, 3),
-                rgb[:8, -8:].reshape(-1, 3),
-                rgb[-8:, :8].reshape(-1, 3),
-                rgb[-8:, -8:].reshape(-1, 3),
-            ],
+        h, w = rgb.shape[:2]
+        border = np.concatenate(
+            [rgb[:6].reshape(-1, 3), rgb[-6:].reshape(-1, 3), rgb[:, :6].reshape(-1, 3), rgb[:, -6:].reshape(-1, 3)],
             axis=0,
         )
-        bg_color = np.median(corners, axis=0)
+        bg_color = np.median(border, axis=0)
         dist = np.linalg.norm(rgb - bg_color[None, None, :], axis=2)
 
-        # Soft feather ramp between threshold 22 and 55
-        alpha = np.clip((dist - 22.0) / 33.0, 0.0, 1.0) * 255.0
+        bg_like = dist < 60.0
+        try:
+            from scipy import ndimage  # type: ignore
+
+            labels, _count = ndimage.label(bg_like)
+            edge_labels = np.unique(
+                np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]])
+            )
+            edge_labels = edge_labels[edge_labels != 0]
+            background = np.isin(labels, edge_labels)
+            # Grow one pixel so the anti-aliased fringe is feathered instead of left as a halo
+            background_soft = ndimage.binary_dilation(background, iterations=2)
+        except Exception:
+            background = bg_like
+            background_soft = bg_like
+
+        # Fully transparent in the background, soft ramp (distance 25..70) on its fringe
+        ramp = np.clip((dist - 25.0) / 45.0, 0.0, 1.0) * 255.0
+        alpha = np.full((h, w), 255.0, dtype=np.float32)
+        alpha[background_soft] = ramp[background_soft]
+        alpha[background & (dist < 25.0)] = 0.0
         arr[:, :, 3] = np.minimum(arr[:, :, 3], alpha)
         out_img = Image.fromarray(arr.astype(np.uint8), mode="RGBA")
         out_img.save(image_path, format="PNG")
-        return "local-chroma-alpha-key"
+        return "local border-connected colour key"
+
+    @staticmethod
+    def _trim_to_content(image_path: Path, padding_ratio: float = 0.06) -> None:
+        """After background removal, crop to the object and scale it up to fill the canvas (kept square)."""
+        try:
+            img = Image.open(image_path).convert("RGBA")
+            bbox = img.getchannel("A").point(lambda v: 255 if v > 16 else 0).getbbox()
+            if not bbox:
+                return
+            w, h = img.size
+            left, top, right, bottom = bbox
+            side = max(right - left, bottom - top)
+            if side >= min(w, h) * 0.85:
+                return  # already fills the frame
+            side = int(side * (1.0 + 2.0 * padding_ratio))
+            cx, cy = (left + right) // 2, (top + bottom) // 2
+            canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+            crop_box = (cx - side // 2, cy - side // 2, cx - side // 2 + side, cy - side // 2 + side)
+            canvas.paste(img.crop(crop_box), (0, 0))
+            canvas.resize((w, h), Image.LANCZOS).save(image_path, format="PNG")
+        except Exception as exc:
+            logger.debug(f"Content trim skipped: {exc}")
 
     # -------------------------------------------------------------------------
     # Sobel PBR Normal, Roughness, Heightmap + Godot 4 StandardMaterial3D .tres

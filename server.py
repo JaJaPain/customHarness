@@ -1175,9 +1175,9 @@ async def _run_agent_turn_locked(
             # Batch VRAM swap: when the next call uses the same GPU engine, keep the LLM
             # unloaded until the last consecutive call of that engine.
             next_tool_name = tool_calls[idx + 1]["name"] if (idx + 1) < len(tool_calls) else None
-            defer_restore = (
-                t_name in ("generate_2d_asset", "generate_game_audio") and next_tool_name == t_name
-            )
+            # (Image -> audio back-to-back also skips the pointless LLM reload in between.)
+            gpu_engines = ("generate_2d_asset", "generate_game_audio")
+            defer_restore = t_name in gpu_engines and next_tool_name in gpu_engines
 
             target_hint = (
                 t_args.get("output_path")

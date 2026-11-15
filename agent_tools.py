@@ -393,8 +393,8 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     },
                     "output_path": {
                         "type": "string",
-                        "description": "Target Godot res:// path (e.g. 'res://audio/sfx/laser_shot.wav' or 'res://audio/music/cyber_loop.ogg').",
-                        "default": "res://audio/sfx/generated_sfx.wav",
+                        "description": "Target Godot res:// path (e.g. 'res://assets/audio/laser_shot.wav' or 'res://assets/audio/cyber_loop.ogg').",
+                        "default": "res://assets/audio/generated_sfx.wav",
                     },
                     "duration_sec": {
                         "type": "number",
@@ -745,7 +745,7 @@ class AgentToolExecutor:
                     prompt=arguments["prompt"],
                     mode=arguments.get("mode", "sfx"),
                     output_path=arguments.get(
-                        "output_path", "res://audio/sfx/generated_sfx.wav"
+                        "output_path", "res://assets/audio/generated_sfx.wav"
                     ),
                     duration_sec=(
                         float(arguments["duration_sec"])
