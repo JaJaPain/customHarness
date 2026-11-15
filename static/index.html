@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Godot 4 Agentic Harness — Local RTX 3060 12GB</title>
-  <link rel="stylesheet" href="/static/styles.css?v=4" />
+  <link rel="stylesheet" href="/static/styles.css?v=6" />
 </head>
 <body>
   <!-- Clean Minimalist Top Bar (Claude Code / Antigravity / Codex Style) -->
@@ -217,7 +217,9 @@
                 📎 Attach
                 <input type="file" id="file-input" multiple hidden />
               </label>
+              <button type="button" id="btn-mic" class="mic-btn" title="Dictate with your microphone (transcribed locally)">🎤 Speak</button>
               <span class="composer-hint">Drag &amp; drop or Ctrl+V paste files/images</span>
+              <span id="mic-hint" class="mic-hint hidden"></span>
             </div>
             <button type="submit" id="btn-send" class="send-btn">Send ↵</button>
           </div>
@@ -417,6 +419,6 @@ col.name = "ArmoredCrate-colonly"</textarea>
     </div>
   </div>
 
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=7"></script>
 </body>
 </html>

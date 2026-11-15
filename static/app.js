@@ -9,6 +9,8 @@ const state = {
   currentFileResPath: "res://scenes/main_3d.tscn",
   yieldedToGodot: false,
   telemetry: null,
+  turnRunning: false,
+  stopRequested: false,
 };
 
 // ============================================================================
@@ -558,16 +560,23 @@ function bindUIEvents() {
   // Chat submit
   document.getElementById("chat-form").addEventListener("submit", (e) => {
     e.preventDefault();
+    if (state.turnRunning) {
+      requestStopTurn();
+      return;
+    }
     const input = document.getElementById("prompt-input");
     const text = input.value.trim();
     if (!text && state.attachments.length === 0) return;
     sendChatPrompt(text || "Inspect the attached files.");
   });
 
+  document.getElementById("btn-mic").addEventListener("click", toggleMicRecording);
+
   // Enter to send (Shift+Enter for newline)
   document.getElementById("prompt-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      if (state.turnRunning) return; // keep typing the next message; only the Stop button stops
       document.getElementById("chat-form").requestSubmit();
     }
   });
@@ -1206,9 +1215,6 @@ function handleLiveStepStart(data) {
   if (statusHeader && data) {
     statusHeader.textContent = `Step ${data.step} — Planning & executing tools...`;
   }
-  if (sendBtn && sendBtn.disabled && data) {
-    sendBtn.textContent = `Step ${data.step}...`;
-  }
 }
 
 function handleLiveToolStart(data) {
@@ -1220,9 +1226,6 @@ function handleLiveToolStart(data) {
 
   if (statusHeader) {
     statusHeader.textContent = `Step ${data.step || 1} (${data.tool_index || 1}/${data.tool_count || 1}) · ${desc.title}`;
-  }
-  if (sendBtn && sendBtn.disabled) {
-    sendBtn.textContent = `Running...`;
   }
   if (listEl) {
     const details = document.createElement("details");
@@ -1307,19 +1310,23 @@ async function sendChatPrompt(promptText, simulateContextTokens = null) {
   progressCard.id = "active-progress-card";
   progressCard.className = "msg msg-assistant";
   progressCard.innerHTML = `
-    <div class="msg-header">
-      <span class="msg-role" style="color:#60a5fa;">● WORKING</span>
-      <span class="msg-meta" id="active-progress-header">Initializing step 1...</span>
-    </div>
     <div id="live-stream-text" class="msg-body live-stream-text hidden"></div>
     <div id="active-progress-list" class="process-list"></div>
     <div id="live-stream-thinking" class="live-stream-thinking hidden"></div>
+    <div class="msg-header live-status-row">
+      <span class="msg-role" style="color:#60a5fa;">● WORKING</span>
+      <span class="msg-meta" id="active-progress-header">Initializing step 1...</span>
+    </div>
   `;
   stream.appendChild(progressCard);
   progressCard.scrollIntoView({ behavior: "smooth", block: "end" });
 
-  sendBtn.disabled = true;
-  sendBtn.textContent = "Running...";
+  state.turnRunning = true;
+  state.stopRequested = false;
+  sendBtn.disabled = false;
+  sendBtn.textContent = "■ Stop";
+  sendBtn.classList.add("stop-mode");
+  sendBtn.title = "Stop this turn";
 
   try {
     const res = await fetch("/api/chat", {
@@ -1347,9 +1354,129 @@ async function sendChatPrompt(promptText, simulateContextTokens = null) {
       existingProg.innerHTML = `<div style="color:#f87171;">✗ Error executing turn: ${escapeHtml(String(err))}</div>`;
     }
   } finally {
+    state.turnRunning = false;
+    state.stopRequested = false;
     sendBtn.disabled = false;
     sendBtn.textContent = "Send ↵";
+    sendBtn.classList.remove("stop-mode");
+    sendBtn.title = "";
   }
+}
+
+// Stop button: ask the server to end the running turn
+async function requestStopTurn() {
+  if (state.stopRequested) return;
+  state.stopRequested = true;
+  const sendBtn = document.getElementById("btn-send");
+  sendBtn.textContent = "Stopping...";
+  sendBtn.disabled = true;
+  const statusHeader = document.getElementById("active-progress-header");
+  if (statusHeader) statusHeader.textContent = "Stopping (a tool that is already running finishes first)...";
+  try {
+    await fetch("/api/chat/stop", { method: "POST" });
+  } catch (err) {
+    console.error("Stop request failed:", err);
+    state.stopRequested = false;
+    sendBtn.disabled = false;
+    sendBtn.textContent = "■ Stop";
+  }
+}
+
+// ---------- Speech-to-text (mic button) ----------
+const mic = { recorder: null, stream: null, chunks: [], startedAt: 0, timer: null, busy: false };
+
+function setMicButton(mode, label) {
+  const btn = document.getElementById("btn-mic");
+  if (!btn) return;
+  btn.classList.toggle("recording", mode === "recording");
+  btn.classList.toggle("busy", mode === "busy");
+  btn.disabled = mode === "busy";
+  btn.textContent = label;
+}
+
+function showMicHint(text, isError = false) {
+  const hint = document.getElementById("mic-hint");
+  if (!hint) return;
+  hint.textContent = text;
+  hint.classList.toggle("error", isError);
+  hint.classList.toggle("hidden", !text);
+}
+
+async function toggleMicRecording() {
+  if (mic.busy) return;
+  if (mic.recorder && mic.recorder.state === "recording") {
+    mic.recorder.stop();
+    return;
+  }
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    showMicHint("This browser cannot record audio.", true);
+    return;
+  }
+  try {
+    mic.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    showMicHint("Microphone access was blocked. Allow it for this page and try again.", true);
+    return;
+  }
+  mic.chunks = [];
+  mic.recorder = new MediaRecorder(mic.stream);
+  mic.recorder.ondataavailable = (e) => {
+    if (e.data && e.data.size) mic.chunks.push(e.data);
+  };
+  mic.recorder.onstop = finishMicRecording;
+  mic.recorder.start();
+  mic.startedAt = Date.now();
+  showMicHint("");
+  const tick = () => {
+    const sec = Math.floor((Date.now() - mic.startedAt) / 1000);
+    setMicButton("recording", `● ${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")} Stop`);
+  };
+  tick();
+  mic.timer = setInterval(tick, 500);
+}
+
+async function finishMicRecording() {
+  clearInterval(mic.timer);
+  if (mic.stream) mic.stream.getTracks().forEach((t) => t.stop());
+  const blob = new Blob(mic.chunks, { type: (mic.recorder && mic.recorder.mimeType) || "audio/webm" });
+  mic.recorder = null;
+  mic.stream = null;
+  mic.busy = true;
+  setMicButton("busy", "Transcribing...");
+  showMicHint("First use downloads the speech model (about 460 MB), so it can take a few minutes.");
+  try {
+    const form = new FormData();
+    form.append("file", blob, "speech.webm");
+    const res = await fetch("/api/transcribe", { method: "POST", body: form });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    if (data.text) {
+      insertIntoPrompt(data.text);
+      showMicHint("");
+    } else {
+      showMicHint("No speech was heard in that recording.", true);
+    }
+  } catch (err) {
+    showMicHint(`Speech-to-text failed: ${err.message || err}`, true);
+  } finally {
+    mic.busy = false;
+    setMicButton("idle", "🎤 Speak");
+  }
+}
+
+// Insert dictated text at the cursor without sending it, so it can be corrected first
+function insertIntoPrompt(text) {
+  const input = document.getElementById("prompt-input");
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? input.value.length;
+  const before = input.value.slice(0, start);
+  const after = input.value.slice(end);
+  const lead = before && !/\s$/.test(before) ? " " : "";
+  const trail = after && !/^\s/.test(after) ? " " : "";
+  input.value = before + lead + text + trail + after;
+  const pos = (before + lead + text).length;
+  input.focus();
+  input.setSelectionRange(pos, pos);
 }
 
 function appendAssistantTurnCard(data) {

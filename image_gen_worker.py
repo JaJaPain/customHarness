@@ -84,7 +84,7 @@ class ImageGenWorker:
     ) -> List[str]:
         sd_exe = self.orchestrator.get_sd_binary_path()
         img_model_info = IMAGE_MODELS[self.orchestrator.active_image_model_id]
-        model_path = self.orchestrator.models_dir / img_model_info["filename"]
+        model_path = self.orchestrator.find_model(img_model_info["filename"])
 
         cmd = [
             str(sd_exe),
@@ -114,7 +114,7 @@ class ImageGenWorker:
 
         # FLUX needs its VAE and both text encoders alongside the diffusion model
         for flag, fname in self.FLUX_COMPANION_FILES:
-            aux = self.orchestrator.models_dir / fname
+            aux = self.orchestrator.find_model(fname)
             if aux.exists():
                 cmd.extend([flag, str(aux)])
 
@@ -138,10 +138,10 @@ class ImageGenWorker:
         missing: List[str] = []
         if not sd_exe.exists():
             missing.append(f"stable-diffusion.cpp binary ({sd_exe.name}) in bin/")
-        if not (models_dir / img_model_info["filename"]).exists():
+        if not self.orchestrator.find_model(img_model_info["filename"]).exists():
             missing.append(f"{img_model_info['filename']} in models/")
         for _flag, fname in self.FLUX_COMPANION_FILES:
-            if not (models_dir / fname).exists():
+            if not self.orchestrator.find_model(fname).exists():
                 missing.append(f"{fname} in models/")
         if missing:
             return (
@@ -208,7 +208,7 @@ class ImageGenWorker:
             # scripted test mode; in normal use a failure is reported, never papered over with fake art.
             sd_exe = self.orchestrator.get_sd_binary_path()
             img_model_info = IMAGE_MODELS[self.orchestrator.active_image_model_id]
-            model_path = self.orchestrator.models_dir / img_model_info["filename"]
+            model_path = self.orchestrator.find_model(img_model_info["filename"])
             missing_reason = self.describe_missing_requirements()
 
             if missing_reason and not self._scripted_demo_enabled():

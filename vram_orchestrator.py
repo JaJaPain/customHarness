@@ -441,6 +441,11 @@ class VRAMOrchestrator:
         self.base_dir = Path(base_dir).resolve()
         self.bin_dir = self.base_dir / "bin"
         self.models_dir = self.base_dir / "models"
+        # Optional extra model folders (e.g. on an SSD), checked before models_dir.
+        # Set HARNESS_FAST_MODELS_DIR to one or more folders separated by ';'.
+        self.extra_models_dirs: List[Path] = [
+            Path(d.strip()) for d in os.environ.get("HARNESS_FAST_MODELS_DIR", "").split(";") if d.strip()
+        ]
         self.cache_dir = self.base_dir / "cache"
         self.slots_dir = self.cache_dir / "slots"
         self.kv_disk_dir = self.cache_dir / "kv_disk"
@@ -788,9 +793,9 @@ class VRAMOrchestrator:
         """
         llama_exe = self.get_llama_server_path()
         profile = self.active_profile
-        model_path = self.models_dir / profile.model_filename
+        model_path = self.find_model(profile.model_filename)
         mmproj_path = (
-            self.models_dir / profile.mmproj_filename
+            self.find_model(profile.mmproj_filename)
             if profile.mmproj_filename
             else None
         )
@@ -872,7 +877,7 @@ class VRAMOrchestrator:
 
     def is_llama_binary_and_model_present(self) -> bool:
         llama_exe = self.get_llama_server_path()
-        model_path = self.models_dir / self.active_profile.model_filename
+        model_path = self.find_model(self.active_profile.model_filename)
         return llama_exe.exists() and model_path.exists()
 
     # -------------------------------------------------------------------------
@@ -941,6 +946,14 @@ class VRAMOrchestrator:
 
     LLAMA_STARTUP_TIMEOUT_SEC = 300.0  # cold-loading ~8.5 GB of weights from disk takes 1-2 minutes
 
+    def find_model(self, name: str) -> Path:
+        """Path of a model file/folder: the first extra folder that has it, else models_dir (also the download target)."""
+        for d in self.extra_models_dirs:
+            candidate = d / name
+            if candidate.exists():
+                return candidate
+        return self.models_dir / name
+
     def is_llama_alive(self) -> bool:
         return self._llama_process is not None and self._llama_process.poll() is None
 
@@ -955,7 +968,7 @@ class VRAMOrchestrator:
     def describe_llm_unavailable(self) -> str:
         """Human-readable reason the local model is not running (shown in the chat instead of a fake reply)."""
         llama_exe = self.get_llama_server_path()
-        model_path = self.models_dir / self.active_profile.model_filename
+        model_path = self.find_model(self.active_profile.model_filename)
         if not llama_exe.exists():
             return (
                 f"`llama-server.exe` was not found in `{self.bin_dir}`. "
@@ -1273,7 +1286,7 @@ class VRAMOrchestrator:
         }
 
     async def compact_and_return_to_tier1(
-        self, messages: List[Dict[str, Any]], keep_recent_turns: int = 8
+        self, messages: List[Dict[str, Any]], keep_recent_turns: int = 8, already_compacted: bool = False
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
         After running a heavy turn in HYBRID_RAM_OVERFLOW (or reaching ~25,000 tokens),
@@ -1287,14 +1300,20 @@ class VRAMOrchestrator:
                 self._llama_process is not None
                 and self._llama_process.poll() is None
             )
-            pruned_messages, flush_meta = await self.memory_rag.run_pre_compaction_flush(
-                messages, llama_alive=llama_alive
-            )
-            self._last_memory_flush_meta = flush_meta
+            if already_compacted:
+                # The caller built the condensed history (and ran the memory flush) itself:
+                # only do the bookkeeping and the return to Tier 1 below.
+                flush_meta = self._last_memory_flush_meta or {}
+                compacted = list(messages)
+            else:
+                pruned_messages, flush_meta = await self.memory_rag.run_pre_compaction_flush(
+                    messages, llama_alive=llama_alive
+                )
+                self._last_memory_flush_meta = flush_meta
 
-            compacted = self.compact_conversation_history(
-                pruned_messages, keep_recent_turns=keep_recent_turns
-            )
+                compacted = self.compact_conversation_history(
+                    pruned_messages, keep_recent_turns=keep_recent_turns
+                )
             # Keep System Prompt + pinned .harness/MEMORY.md static at the very top of the prompt
             if compacted and compacted[0].get("role") == "system":
                 compacted[0]["content"] = self.memory_rag.build_static_system_prompt(
@@ -1727,9 +1746,9 @@ class VRAMOrchestrator:
 
         models_status: Dict[str, Any] = {}
         for pid, prof in MODEL_PROFILES.items():
-            mpath = self.models_dir / prof.model_filename
+            mpath = self.find_model(prof.model_filename)
             mmpath = (
-                self.models_dir / prof.mmproj_filename
+                self.find_model(prof.mmproj_filename)
                 if prof.mmproj_filename
                 else None
             )
@@ -1747,10 +1766,10 @@ class VRAMOrchestrator:
 
         image_models_status: Dict[str, Any] = {}
         for iid, imod in IMAGE_MODELS.items():
-            ipath = self.models_dir / imod["filename"]
+            ipath = self.find_model(imod["filename"])
             missing_files = [
                 f for f in [imod["filename"]] + [c["filename"] for c in imod.get("companions", [])]
-                if not (self.models_dir / f).exists()
+                if not (self.find_model(f)).exists()
             ]
             image_models_status[iid] = {
                 "id": iid,
@@ -1765,7 +1784,7 @@ class VRAMOrchestrator:
 
         audio_models_status: Dict[str, Any] = {}
         for aid, amod in AUDIO_MODELS.items():
-            apath = self.models_dir / amod["local_dir"]
+            apath = self.find_model(amod["local_dir"])
             has_weights = apath.exists() and any(apath.rglob("*.safetensors"))
             audio_models_status[aid] = {
                 "id": aid,
@@ -2106,7 +2125,7 @@ class VRAMOrchestrator:
             if category == "llm" and item_id in MODEL_PROFILES:
                 prof = MODEL_PROFILES[item_id]
                 downloaded_paths: List[str] = []
-                model_dest = self.models_dir / prof.model_filename
+                model_dest = self.find_model(prof.model_filename)
                 if not (model_dest.exists() and model_dest.stat().st_size > 50 * 1024 * 1024):
                     await self._stream_file_download(
                         job_key=job_key,
@@ -2118,7 +2137,7 @@ class VRAMOrchestrator:
                 downloaded_paths.append(str(model_dest))
 
                 if prof.mmproj_filename and prof.hf_mmproj_url:
-                    mmproj_dest = self.models_dir / prof.mmproj_filename
+                    mmproj_dest = self.find_model(prof.mmproj_filename)
                     if not (mmproj_dest.exists() and mmproj_dest.stat().st_size > 1024 * 1024):
                         try:
                             await self._stream_file_download(
@@ -2147,7 +2166,7 @@ class VRAMOrchestrator:
 
             if category == "image_model" and item_id in IMAGE_MODELS:
                 imod = IMAGE_MODELS[item_id]
-                dest = self.models_dir / imod["filename"]
+                dest = self.find_model(imod["filename"])
                 if not (dest.exists() and dest.stat().st_size > 50 * 1024 * 1024):
                     await self._stream_file_download(
                         job_key=job_key,
@@ -2157,7 +2176,7 @@ class VRAMOrchestrator:
                         progress_cb=progress_cb,
                     )
                 for comp in imod.get("companions", []):
-                    comp_dest = self.models_dir / comp["filename"]
+                    comp_dest = self.find_model(comp["filename"])
                     if not (comp_dest.exists() and comp_dest.stat().st_size > 1024 * 1024):
                         await self._stream_file_download(
                             job_key=job_key,
@@ -2177,7 +2196,7 @@ class VRAMOrchestrator:
 
             if category == "audio_model" and item_id in AUDIO_MODELS:
                 amod = AUDIO_MODELS[item_id]
-                target_dir = self.models_dir / amod["local_dir"]
+                target_dir = self.find_model(amod["local_dir"])
                 target_dir.mkdir(parents=True, exist_ok=True)
                 token = (hf_token or os.environ.get("HF_TOKEN") or "").strip() or None
                 primary_repo = amod["repo_id"]

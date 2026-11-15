@@ -311,7 +311,7 @@ class AudioGenWorker:
             return stereo, "procedural_44k1_stereo_dsp (scripted demo)"
 
         # Real generation only. Any problem is raised with a clear reason - never replaced by fake audio.
-        local_model_dir = self.orchestrator.models_dir / "stable-audio-open-1.0"
+        local_model_dir = self.orchestrator.find_model("stable-audio-open-1.0")
         if not (local_model_dir / "model_index.json").exists():
             raise RuntimeError(
                 "Audio generation is not installed yet: the Stable Audio Open 1.0 weights are missing from "

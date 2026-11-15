@@ -24,6 +24,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, W
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+from speech_worker import SpeechToText, SpeechUnavailableError
 from pydantic import BaseModel, Field
 
 from agent_tools import (
@@ -59,6 +61,7 @@ WORKSPACE_CONFIG_FILE = BASE_DIR / "cache" / (
 )
 MAX_RECENT_PROJECTS = 20
 STATIC_DIR = BASE_DIR / "static"
+speech_to_text = SpeechToText(BASE_DIR / "models" / "whisper")
 
 
 def _load_persisted_workspace_dir() -> Path:
@@ -389,11 +392,22 @@ app.add_middleware(
 # =============================================================================
 # Request Models
 # =============================================================================
+# Tool-call rounds allowed in one turn before the agent stops and waits for "continue".
+# High by default so a whole project can be built unattended; override with HARNESS_MAX_STEPS.
+MAX_STEPS_CAP = 1000
+try:
+    DEFAULT_MAX_STEPS = max(1, min(MAX_STEPS_CAP, int(os.environ.get("HARNESS_MAX_STEPS", "300"))))
+except ValueError:
+    DEFAULT_MAX_STEPS = 300
+# Stop a turn when the model issues the exact same tool calls this many rounds in a row.
+STUCK_REPEAT_LIMIT = 5
+
+
 class ChatRequest(BaseModel):
     prompt: str
     attachments: List[Dict[str, Any]] = Field(default_factory=list)
     simulate_context_tokens: Optional[int] = None
-    max_steps: int = 30
+    max_steps: int = DEFAULT_MAX_STEPS
 
 
 class ToolCallRequest(BaseModel):
@@ -470,6 +484,8 @@ class WorkspaceMkdirRequest(BaseModel):
 #   <project>/.harness/conversations/active.txt  id of the conversation that is open
 # =============================================================================
 TURN_LOCK = asyncio.Lock()
+# Set by POST /api/chat/stop; the running turn checks it between tokens, tool calls and steps.
+STOP_REQUESTED = threading.Event()
 _last_project_context_sig: Optional[str] = None
 ACTIVE_CONVERSATION: Dict[str, Any] = {"id": "", "title": "New conversation", "created_at": ""}
 
@@ -830,6 +846,51 @@ async def _call_llm(
 
 _STREAM_FLUSH_INTERVAL_SEC = 0.08
 
+# Repetition watchdog for streamed thinking / answer text (never applied to tool-call arguments,
+# where repeated lines are normal file content).
+_REPEAT_CHECK_EVERY_CHARS = 300
+_REPEAT_MIN_TEXT = 800
+_REPEAT_BLOCK_COPIES = 4      # the same block back-to-back this many times
+_REPEAT_LINE_COPIES = 6       # or the same line this many times in the last 40 lines
+# Automatic "stop reasoning and act" nudges allowed in a row before the turn gives up.
+MAX_NUDGES_IN_A_ROW = 3
+
+
+def _find_repetition_start(text: str) -> Optional[int]:
+    """
+    If the end of `text` is the model looping (a block repeated back-to-back, or one line repeated
+    many times), return the index to cut at so one copy of the repeated part is kept. Else None.
+    """
+    if len(text) < _REPEAT_MIN_TEXT:
+        return None
+    tail = text[-3200:]
+    offset = len(text) - len(tail)
+
+    # 1. A block of 24..800 chars repeated back-to-back at the very end
+    max_period = len(tail) // _REPEAT_BLOCK_COPIES
+    for period in range(24, min(800, max_period) + 1):
+        block = tail[-period:]
+        if not block.strip():
+            continue
+        if tail[-period * _REPEAT_BLOCK_COPIES :] == block * _REPEAT_BLOCK_COPIES:
+            start = len(tail) - period * _REPEAT_BLOCK_COPIES
+            while start - period >= 0 and tail[start - period : start] == block:
+                start -= period
+            return offset + start + period
+
+    # 2. The same substantial line many times in the recent lines (loops that vary slightly in between)
+    lines = tail.split("\n")[1:-1]  # drop the possibly partial first and last lines
+    recent = [ln.strip() for ln in lines[-40:]]
+    counts: Dict[str, int] = {}
+    for ln in recent:
+        if len(ln) >= 30:
+            counts[ln] = counts.get(ln, 0) + 1
+    for ln, n in counts.items():
+        if n >= _REPEAT_LINE_COPIES:
+            first = tail.find(ln)
+            return offset + first + len(ln)
+    return None
+
 
 async def _stream_chat_completion(
     url: str, payload: Dict[str, Any], step_index: int
@@ -846,6 +907,10 @@ async def _stream_chat_completion(
     pending = {"content": "", "reasoning": ""}
     tool_progress: Optional[Dict[str, Any]] = None
     last_flush = time.monotonic()
+    text_len = {"content": 0, "reasoning": 0}
+    checked_len = {"content": 0, "reasoning": 0}
+    repetition_cut: Optional[Tuple[str, int]] = None
+    stopped_by_user = False
 
     async def flush(force: bool = False) -> None:
         nonlocal last_flush, tool_progress
@@ -879,7 +944,25 @@ async def _stream_chat_completion(
                     raise LLMUnavailableError(
                         f"llama-server rejected the request (HTTP {resp.status_code}): {body}"
                     )
-                async for line in resp.aiter_lines():
+                line_iter = resp.aiter_lines().__aiter__()
+                next_line: Optional["asyncio.Future[str]"] = None
+                while True:
+                    # Wait for the next line in short slices so a Stop request is noticed even while
+                    # the model is still reading the prompt and has not produced a token yet.
+                    if next_line is None:
+                        next_line = asyncio.ensure_future(line_iter.__anext__())
+                    done, _pending = await asyncio.wait({next_line}, timeout=0.4)
+                    if STOP_REQUESTED.is_set():
+                        next_line.cancel()
+                        stopped_by_user = True
+                        break  # leaving the stream closes the connection, which stops llama-server
+                    if not done:
+                        continue
+                    finished, next_line = next_line, None
+                    try:
+                        line = finished.result()
+                    except StopAsyncIteration:
+                        break
                     if not line.startswith("data:"):
                         continue
                     data_str = line[5:].strip()
@@ -918,7 +1001,40 @@ async def _stream_chat_completion(
                     if choice.get("finish_reason"):
                         finish_reason = choice["finish_reason"]
                     await flush()
+
+                    # Repetition watchdog: stop generating as soon as the text is clearly looping
+                    for kind, parts, key in (
+                        ("reasoning", reasoning_parts, "reasoning_content"),
+                        ("content", content_parts, "content"),
+                    ):
+                        if not delta.get(key):
+                            continue
+                        text_len[kind] += len(delta[key])
+                        if text_len[kind] - checked_len[kind] < _REPEAT_CHECK_EVERY_CHARS:
+                            continue
+                        checked_len[kind] = text_len[kind]
+                        cut_at = _find_repetition_start("".join(parts))
+                        if cut_at is not None:
+                            repetition_cut = (kind, cut_at)
+                            break
+                    if repetition_cut:
+                        break  # leaving the stream closes the connection, which stops llama-server
         await flush(force=True)
+        if stopped_by_user:
+            calls.clear()  # a half-written tool call must not run
+            finish_reason = "stopped"
+        if repetition_cut:
+            kind, cut_at = repetition_cut
+            logger.warning(f"[AgentLoop] Step {step_index}: model was repeating itself in its {kind}; stopped it.")
+            if kind == "reasoning":
+                reasoning_parts = ["".join(reasoning_parts)[:cut_at]]
+            else:
+                content_parts = ["".join(content_parts)[:cut_at]]
+            calls.clear()  # a half-written tool call cannot be trusted
+            finish_reason = "repetition"
+            await ws_manager.broadcast(
+                "llm_status", {"message": f"Step {step_index}: model was repeating itself - nudging it to move on..."}
+            )
     except (LLMUnavailableError, LLMContextOverflowError):
         raise
     except Exception as exc:
@@ -937,6 +1053,219 @@ async def _stream_chat_completion(
         if c["name"]
     ]
     return "".join(content_parts), "".join(reasoning_parts), (tool_calls or None), finish_reason
+
+
+# =============================================================================
+# Context management: keep long unattended turns inside the fast 32k context
+# =============================================================================
+# Estimated prompt tokens at which the history is condensed before the next model call.
+# 32,768 context - 8,192 reserved for the reply, minus a margin because code tokenises
+# worse than the chars/3.6 estimate assumes.
+CONTEXT_SOFT_LIMIT_TOKENS = 20000
+_CONTEXT_KEEP_RECENT_MESSAGES = 8
+_CONTEXT_TAIL_BUDGET_TOKENS = 6000
+_BULKY_ARG_KEYS = ("content", "script", "replace_text", "search_text", "bpy_script", "code")
+_FILE_TOOLS = ("write_file", "apply_diff", "set_input_action", "generate_2d_asset", "generate_game_audio", "run_blender_script")
+_SUMMARY_MARK = "[Context summary - earlier messages were condensed to save memory"
+
+
+def _estimate_history_tokens(history: List[Dict[str, Any]]) -> int:
+    return orchestrator.estimate_turn_tokens(history, TOOL_DEFINITIONS)
+
+
+def _message_text(m: Dict[str, Any]) -> str:
+    content = m.get("content")
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+    return str(content or "")
+
+
+def _trim_old_tool_output(history: List[Dict[str, Any]], keep_recent: int = _CONTEXT_KEEP_RECENT_MESSAGES) -> int:
+    """
+    Stage 1: shrink bulky old material in place - long tool results, file bodies inside old
+    write_file / apply_diff / Blender calls, and old preview images. Returns how many messages changed.
+    """
+    changed = 0
+    for m in history[: max(0, len(history) - keep_recent)]:
+        role = m.get("role")
+        if role == "tool":
+            content = m.get("content")
+            if isinstance(content, str) and len(content) > 600:
+                m["content"] = (
+                    content[:300]
+                    + "\n[... older tool output trimmed to save context; run the tool again if you need it]"
+                )
+                changed += 1
+        elif role == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                fn = tc.get("function") or {}
+                args_text = fn.get("arguments") or ""
+                if len(args_text) <= 800:
+                    continue
+                try:
+                    args = json.loads(args_text)
+                except Exception:
+                    continue
+                if not isinstance(args, dict):
+                    continue
+                touched = False
+                for key in _BULKY_ARG_KEYS:
+                    val = args.get(key)
+                    if isinstance(val, str) and len(val) > 300:
+                        args[key] = f"[{len(val)} characters omitted from history; read the file to see the current version]"
+                        touched = True
+                if touched:
+                    fn["arguments"] = json.dumps(args)
+                    changed += 1
+        elif role == "user" and m.get("synthetic") and isinstance(m.get("content"), list):
+            if any(isinstance(p, dict) and p.get("type") == "image_url" for p in m["content"]):
+                m["content"] = _message_text(m) + " [preview images removed from history]"
+                changed += 1
+    return changed
+
+
+def _build_task_preserving_history(history: List[Dict[str, Any]], current_request: str) -> List[Dict[str, Any]]:
+    """
+    Stage 2: replace older messages with one summary that keeps what the model needs to stay on task:
+    the user's current request in full, earlier requests, files created or changed, the latest
+    validation result and its own most recent steps - followed by the untouched recent messages.
+    """
+    system_msgs = [m for m in history[:1] if m.get("role") == "system"]
+    body = history[len(system_msgs):]
+
+    # Recent tail: newest messages within a token budget, starting on a clean boundary (not a tool result)
+    tail_start = len(body)
+    used = 0
+    for i in range(len(body) - 1, -1, -1):
+        cost = orchestrator.estimate_turn_tokens([body[i]])
+        if used + cost > _CONTEXT_TAIL_BUDGET_TOKENS and len(body) - i > 4:
+            break
+        used += cost
+        tail_start = i
+    while tail_start < len(body) and body[tail_start].get("role") == "tool":
+        tail_start += 1
+    older, recent = body[:tail_start], body[tail_start:]
+    if not older:
+        return list(history)
+
+    previous_summary = ""
+    earlier_requests: List[str] = []
+    files: List[str] = []
+    progress: List[str] = []
+    last_validation = ""
+    call_names: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+
+    for idx, m in enumerate(body):
+        in_older = idx < tail_start
+        role = m.get("role")
+        text = _message_text(m)
+        if role == "system" and text.startswith(_SUMMARY_MARK):
+            previous_summary = text
+        elif role == "user" and not m.get("synthetic") and in_older:
+            shown = str(m.get("display_text") or text).strip()
+            if shown and shown.strip() != current_request.strip():
+                earlier_requests.append(shown[:300].replace("\n", " "))
+        elif role == "assistant":
+            if in_older and text.strip():
+                progress.append(text.strip().replace("\n", " ")[:220])
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except Exception:
+                    args = {}
+                args = args if isinstance(args, dict) else {}
+                call_names[str(tc.get("id"))] = (str(fn.get("name")), args)
+                if fn.get("name") in _FILE_TOOLS:
+                    path = args.get("path") or args.get("output_path") or args.get("output_glb_path") or args.get("action")
+                    if path and str(path) not in files:
+                        files.append(str(path))
+        elif role == "tool":
+            name, args = call_names.get(str(m.get("tool_call_id")), ("", {}))
+            if name == "run_command" and "godot" in str(args.get("command", "")).lower():
+                try:
+                    parsed = json.loads(text)
+                    last_validation = str(parsed.get("stdout") or parsed.get("error") or text)
+                except Exception:
+                    last_validation = text
+
+    # Carry forward what an earlier summary already recorded (merged, not nested)
+    if previous_summary:
+        section = ""
+        old_files: List[str] = []
+        old_requests: List[str] = []
+        old_validation: List[str] = []
+        for line in previous_summary.splitlines():
+            if line.startswith("## "):
+                section = line
+                continue
+            if section.startswith("## Files created") and line.startswith("- "):
+                old_files.append(line[2:].strip())
+            elif section.startswith("## Earlier requests") and line.startswith("- "):
+                old_requests.append(line[2:].strip())
+            elif section.startswith("## Latest project validation"):
+                old_validation.append(line)
+        files = [f for f in old_files if f not in files] + files
+        earlier_requests = old_requests + earlier_requests
+        if not last_validation.strip():
+            last_validation = "\n".join(old_validation)
+
+    parts = [
+        _SUMMARY_MARK + ". Everything below is still true.]",
+        "## What the user asked for (the task you are working on)",
+        (current_request or "(see the most recent user message)").strip()[:9000],
+    ]
+    if earlier_requests:
+        parts += ["## Earlier requests in this conversation"] + [f"- {r}" for r in earlier_requests[-6:]]
+    if files:
+        parts += ["## Files created or changed so far (they exist on disk - do not recreate them blindly)"]
+        parts += [f"- {f}" for f in files[-80:]]
+    parts += ["## Latest project validation result", (last_validation.strip()[:1800] or "(the project has not been validated yet)")]
+    if progress:
+        parts += ["## Your most recent steps before this summary"] + [f"- {s_}" for s_ in progress[-12:]]
+    parts.append(
+        "Continue the task from here. Do not start over. If you need a file's current contents, read it with "
+        "read_file; use list_dir to see what exists. Stay on the user's task - do not investigate unrelated things."
+    )
+    summary_msg = {"role": "system", "content": "\n".join(parts)}
+    return system_msgs + [summary_msg] + recent
+
+
+async def _condense_context(current_request: str, reason: str, force_full: bool = False) -> Dict[str, Any]:
+    """
+    Keep the conversation inside the fast context window. Stage 1 trims old bulky tool output;
+    if that is not enough (or force_full), stage 2 summarises older messages while keeping the task.
+    Mutates CONVERSATION_HISTORY. Returns what was done.
+    """
+    before = _estimate_history_tokens(CONVERSATION_HISTORY)
+    trimmed = _trim_old_tool_output(CONVERSATION_HISTORY)
+    after_trim = _estimate_history_tokens(CONVERSATION_HISTORY)
+    report: Dict[str, Any] = {"before": before, "after": after_trim, "trimmed_messages": trimmed, "summarised": False}
+    needs_full = force_full or after_trim > int(CONTEXT_SOFT_LIMIT_TOKENS * 0.8)
+    if not needs_full and orchestrator.state != EngineState.HYBRID_RAM_OVERFLOW:
+        logger.info(f"[Context] {reason}: trimmed old tool output, {before} -> {after_trim} est. tokens")
+        return report
+
+    await ws_manager.broadcast(
+        "llm_status", {"message": "Condensing the earlier conversation so the model stays fast and on task..."}
+    )
+    try:
+        # Archive the full detail into project memory (searchable with recall_memory) before dropping it
+        _, flush_meta = await orchestrator.memory_rag.run_pre_compaction_flush(
+            CONVERSATION_HISTORY, llama_alive=orchestrator.is_llama_alive()
+        )
+        orchestrator._last_memory_flush_meta = flush_meta
+    except Exception as exc:
+        logger.warning(f"[Context] memory flush before condensing failed (continuing): {exc}")
+
+    condensed = _build_task_preserving_history(CONVERSATION_HISTORY, current_request)
+    condensed, meta = await orchestrator.compact_and_return_to_tier1(condensed, already_compacted=True)
+    CONVERSATION_HISTORY.clear()
+    CONVERSATION_HISTORY.extend(condensed)
+    report.update({"after": _estimate_history_tokens(CONVERSATION_HISTORY), "summarised": True, "meta": meta})
+    logger.info(f"[Context] {reason}: condensed history {before} -> {report['after']} est. tokens")
+    await ws_manager.broadcast("telemetry_update", get_full_status_snapshot())
+    return report
 
 
 # =============================================================================
@@ -985,7 +1314,7 @@ async def run_agent_turn(
     user_prompt: str,
     attachments: List[Dict[str, Any]],
     simulate_context_tokens: Optional[int] = None,
-    max_steps: int = 30,
+    max_steps: int = DEFAULT_MAX_STEPS,
 ) -> Dict[str, Any]:
     """Run one user turn (serialized: one turn at a time) and persist the conversation afterwards."""
     async with TURN_LOCK:
@@ -1027,7 +1356,7 @@ async def _run_agent_turn_locked(
       3. If the turn ran in Tier 2 RAM overflow, compact older turns and return to Tier 1.
     """
     global _last_project_context_sig
-    max_steps = max(1, min(60, int(max_steps)))
+    max_steps = max(1, min(MAX_STEPS_CAP, int(max_steps)))
 
     # 1. Construct multimodal content parts
     content_parts: List[Dict[str, Any]] = []
@@ -1066,15 +1395,32 @@ async def _run_agent_turn_locked(
     executed_tools: List[Dict[str, Any]] = []
     vision_self_checks: List[Dict[str, Any]] = []
     overflow_triggered = False
-    compacted_for_overflow = False
-    nudged_after_cutoff = False
+    overflow_retries = 0
+    condensed_this_turn = False
+    nudges_in_a_row = 0
     error_text: Optional[str] = None
     hit_step_limit = False
+    last_call_signature: Optional[str] = None
+    repeat_count = 0
+    stuck_in_loop = False
+
+    stopped_note = "_(Stopped by you. The work done so far is kept - tell me how to continue.)_"
+    STOP_REQUESTED.clear()
 
     # 2. Multi-step tool loop
     for step_idx in range(1, max_steps + 1):
+        if STOP_REQUESTED.is_set():
+            all_clean_replies.append(stopped_note)
+            break
         logger.info(f"[AgentLoop] Step {step_idx}/{max_steps}")
         await ws_manager.broadcast("step_start", {"step": step_idx, "max_steps": max_steps})
+
+        # Keep the conversation inside the fast context: condense before it overflows, as often as needed
+        if not _scripted_demo_enabled() and _estimate_history_tokens(CONVERSATION_HISTORY) > CONTEXT_SOFT_LIMIT_TOKENS:
+            condense_report = await _condense_context(user_prompt, f"step {step_idx} soft limit")
+            if condense_report["summarised"]:
+                history_len_before_reply = -1
+                condensed_this_turn = True
 
         messages_for_estimate = list(CONVERSATION_HISTORY)
         if step_idx == 1 and simulate_context_tokens and simulate_context_tokens > 26000:
@@ -1098,22 +1444,22 @@ async def _run_agent_turn_locked(
                 CONVERSATION_HISTORY, user_prompt, step_idx, executed_tools
             )
         except LLMContextOverflowError as exc:
-            if compacted_for_overflow:
-                error_text = f"The conversation no longer fits the model's context window even after compaction: {exc}"
+            # The server refused the request as too long (the estimate was off): condense and retry.
+            # Only give up if it still does not fit right after condensing, twice in a row.
+            overflow_retries += 1
+            if overflow_retries > 2:
+                error_text = f"The conversation no longer fits the model's context window even after condensing it: {exc}"
                 break
-            compacted_for_overflow = True
-            logger.warning("Context overflow reported by llama-server -> compacting history and retrying.")
-            compacted_hist, _ = await orchestrator.compact_and_return_to_tier1(
-                CONVERSATION_HISTORY, keep_recent_turns=6
-            )
-            CONVERSATION_HISTORY.clear()
-            CONVERSATION_HISTORY.extend(compacted_hist)
+            logger.warning("Context overflow reported by llama-server -> condensing history and retrying.")
+            await _condense_context(user_prompt, "server reported overflow", force_full=True)
             history_len_before_reply = -1
+            condensed_this_turn = True
             continue
         except LLMUnavailableError as exc:
             error_text = str(exc)
             break
 
+        overflow_retries = 0
         parsed = parse_thinking_and_tool_calls(raw_text, api_tool_calls)
         step_thinking = "\n\n".join(t for t in (reasoning_text.strip(), parsed["thinking"]) if t)
         step_reply = parsed["clean_content"]
@@ -1123,11 +1469,25 @@ async def _run_agent_turn_locked(
             all_thinking_traces.append(f"[Step {step_idx}]\n{step_thinking}")
         if step_reply:
             all_clean_replies.append(step_reply)
-        cut_off = finish_reason == "length" and not tool_calls
-        if cut_off and nudged_after_cutoff:
+        if finish_reason == "stopped" or STOP_REQUESTED.is_set():
+            # Keep whatever the model had written, run none of its tool calls, end the turn
+            if step_reply or step_thinking:
+                stopped_msg: Dict[str, Any] = {"role": "assistant", "content": step_reply}
+                if step_thinking:
+                    stopped_msg["thinking"] = step_thinking
+                CONVERSATION_HISTORY.append(stopped_msg)
+            all_clean_replies.append(stopped_note)
+            break
+        cut_off = finish_reason in ("length", "repetition") and not tool_calls
+        out_of_nudges = cut_off and nudges_in_a_row >= MAX_NUDGES_IN_A_ROW
+        if out_of_nudges:
+            reason = "kept repeating itself" if finish_reason == "repetition" else "kept running into the length limit"
             all_clean_replies.append(
-                "_(The model's output was cut off at the token limit. Say \"continue\" to let it carry on.)_"
+                f"_(The model {reason} even after {MAX_NUDGES_IN_A_ROW} automatic nudges. "
+                "Say \"continue\" to let it try again.)_"
             )
+        if not cut_off:
+            nudges_in_a_row = 0
 
         # Record the assistant step exactly as the model produced it, so the tool results
         # that follow are correctly paired with their calls on the next request.
@@ -1145,30 +1505,43 @@ async def _run_agent_turn_locked(
             ]
         CONVERSATION_HISTORY.append(assistant_msg)
 
-        if cut_off and not nudged_after_cutoff:
-            # The model ran out of tokens mid-thought (usually over-long reasoning): nudge it once to act
-            nudged_after_cutoff = True
-            CONVERSATION_HISTORY.append(
-                {
-                    "role": "user",
-                    "synthetic": True,
-                    "content": (
-                        "[Automatic notice] Your previous output hit the length limit before you called a tool "
-                        "or finished. Continue now: keep your reasoning to a few sentences and make the next "
-                        "tool call (or give the final answer) immediately."
-                    ),
-                }
-            )
+        if cut_off and not out_of_nudges:
+            # The model looped or ran out of tokens mid-thought: nudge it to act, the turn carries on
+            nudges_in_a_row += 1
+            if finish_reason == "repetition":
+                notice = (
+                    "[Automatic notice] You were repeating the same lines over and over, so your output was "
+                    "stopped. Do not restate your plan or re-check what you already know. Decide the single "
+                    "next action now and make that tool call immediately (or give the final answer)."
+                )
+            else:
+                notice = (
+                    "[Automatic notice] Your previous output hit the length limit before you called a tool "
+                    "or finished. Continue now: keep your reasoning to a few sentences and make the next "
+                    "tool call (or give the final answer) immediately."
+                )
+            CONVERSATION_HISTORY.append({"role": "user", "synthetic": True, "content": notice})
             continue
 
         # No tool calls -> the model has given its final answer for this turn
         if not tool_calls:
             break
 
+        # Unattended-run guard: the same tool calls with the same arguments, round after round
+        call_signature = json.dumps([[tc["name"], tc["arguments"]] for tc in tool_calls], sort_keys=True, default=str)
+        repeat_count = repeat_count + 1 if call_signature == last_call_signature else 1
+        last_call_signature = call_signature
+        if repeat_count >= STUCK_REPEAT_LIMIT:
+            stuck_in_loop = True
+
         step_vision_checks: List[Dict[str, Any]] = []
         paused_for_approval = False
 
+        stopped_mid_tools = False
         for idx, tc in enumerate(tool_calls):
+            if STOP_REQUESTED.is_set():
+                stopped_mid_tools = True  # remaining calls are reported to the model as not executed
+                break
             t_name = tc["name"]
             t_args = tc["arguments"]
 
@@ -1295,6 +1668,15 @@ async def _run_agent_turn_locked(
                 "_(Paused: a shell command is waiting for your approval. Approve it, then tell me to continue.)_"
             )
             break
+        if stopped_mid_tools or STOP_REQUESTED.is_set():
+            all_clean_replies.append(stopped_note)
+            break
+        if stuck_in_loop:
+            all_clean_replies.append(
+                f"_(Stopped: the model repeated the same tool call {STUCK_REPEAT_LIMIT} times in a row "
+                "without making progress. Tell it what to do differently, or say \"continue\".)_"
+            )
+            break
     else:
         hit_step_limit = True
 
@@ -1323,13 +1705,9 @@ async def _run_agent_turn_locked(
 
     # 4. If Tier 2 RAM overflow was used, compact older turns and return to Tier 1 Fast VRAM Mode
     compaction_meta = None
-    if overflow_triggered:
-        compacted_hist, compaction_meta = await orchestrator.compact_and_return_to_tier1(
-            CONVERSATION_HISTORY
-        )
-        CONVERSATION_HISTORY.clear()
-        CONVERSATION_HISTORY.extend(compacted_hist)
-        await ws_manager.broadcast("telemetry_update", get_full_status_snapshot())
+    if overflow_triggered and orchestrator.state == EngineState.HYBRID_RAM_OVERFLOW:
+        end_report = await _condense_context(user_prompt, "end of turn in overflow mode", force_full=True)
+        compaction_meta = end_report.get("meta")
 
     return {
         "thinking": thinking_trace,
@@ -1580,6 +1958,38 @@ async def api_chat(req: ChatRequest) -> Dict[str, Any]:
         simulate_context_tokens=req.simulate_context_tokens,
         max_steps=req.max_steps,
     )
+
+
+@app.post("/api/chat/stop")
+async def api_chat_stop() -> Dict[str, Any]:
+    """Ask the running turn to stop: cuts off the current model output and skips tool calls not yet started."""
+    if not TURN_LOCK.locked():
+        return {"status": "idle", "message": "No turn is running."}
+    STOP_REQUESTED.set()
+    await ws_manager.broadcast("llm_status", {"message": "Stopping..."})
+    return {"status": "stopping"}
+
+
+@app.get("/api/transcribe/status")
+async def api_transcribe_status() -> Dict[str, Any]:
+    return speech_to_text.status()
+
+
+@app.post("/api/transcribe")
+async def api_transcribe(file: UploadFile = File(...)) -> Dict[str, Any]:
+    """Speech-to-text for the composer's mic button. Runs on the CPU, so it works while the model is busy."""
+    audio_bytes = await file.read()
+    if len(audio_bytes) < 800:
+        raise HTTPException(status_code=400, detail="The recording was empty.")
+    if len(audio_bytes) > 60 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="The recording is too long (limit 60 MB).")
+    try:
+        return await asyncio.to_thread(speech_to_text.transcribe, audio_bytes)
+    except SpeechUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Speech-to-text failed")
+        raise HTTPException(status_code=500, detail=f"Speech-to-text failed: {type(exc).__name__}: {exc}") from exc
 
 
 def _conversations_payload() -> Dict[str, Any]:

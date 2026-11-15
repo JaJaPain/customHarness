@@ -1309,7 +1309,10 @@ class AgentToolExecutor:
         cmd_stripped = command.strip()
         cmd_lower = cmd_stripped.lower()
         if re.match(r"^(?:godot4?|\"[^\"]*godot[^\"]*\")\b", cmd_lower) and "--headless" in cmd_lower:
-            return await self.validate_godot_project(raw_command=cmd_stripped, timeout_sec=timeout_sec)
+            # Runs Godot several times (import, launch, each scene): keep the server responsive meanwhile
+            return await asyncio.to_thread(
+                lambda: asyncio.run(self.validate_godot_project(raw_command=cmd_stripped, timeout_sec=timeout_sec))
+            )
 
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -1517,8 +1520,20 @@ class AgentToolExecutor:
             )
         else:
             proj_text = proj_file.read_text(encoding="utf-8", errors="replace")
-            m_scene = re.search(r'run/main_scene\s*=\s*"([^"]+)"', proj_text)
-            if m_scene:
+            m_scene = re.search(r'^run/main_scene\s*=\s*"([^"]+)"', proj_text, flags=re.MULTILINE)
+            if not m_scene:
+                diagnostics.append(
+                    {
+                        "file": "res://project.godot",
+                        "severity": "error",
+                        "message": (
+                            "No main scene is set, so the game cannot start. Under [application] add a line "
+                            'exactly like: run/main_scene="res://scenes/main_menu.tscn" (the key is '
+                            "run/main_scene, not config/main_scene)."
+                        ),
+                    }
+                )
+            elif not m_scene.group(1).startswith("uid://"):
                 main_scene_res = m_scene.group(1)
                 try:
                     if not self.resolve_workspace_path(main_scene_res).exists():
@@ -1579,47 +1594,148 @@ class AgentToolExecutor:
         godot_exe = self.detect_godot_executable()
         cli_output = ""
         cli_exit = 0
-        if godot_exe and proj_file.exists():
+        godot_ran = False
+        launch_notes: List[str] = []
+        seen_msgs: set = set()
+        # Engine shutdown noise that is not a project problem
+        benign = ("resources still in use at exit", "ObjectDB instances leaked", "at: cleanup (", "at: clear (")
+        # Errors that mean a scene could not even be loaded (as opposed to runtime errors)
+        load_failure_marks = (
+            "Parse Error", "Parse error", "Failed loading resource", "Failed loading scene",
+            "Failed to load script", "Compile Error", "Cannot open file", "Failed to instantiate",
+            "no main scene defined", "Can't run project",
+        )
+
+        def _run_godot(extra_args: List[str], limit_sec: float) -> Tuple[Optional[int], List[str]]:
+            """Run Godot headless in the project. Returns (exit code or None on timeout, kept output lines)."""
             try:
                 proc_sync = subprocess.run(
-                    # Run the main scene headless for ~90 frames so runtime errors in _ready/_process surface too
-                    [godot_exe, "--headless", "--path", str(self.workspace_dir), "--quit-after", "90"],
+                    [godot_exe, "--headless", "--path", str(self.workspace_dir), *extra_args],
                     cwd=str(self.workspace_dir),
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=float(max(timeout_sec, 45)),
+                    timeout=limit_sec,
                 )
-                raw_lines = ((proc_sync.stdout or "") + "\n" + (proc_sync.stderr or "")).splitlines()
-                # Engine shutdown noise that is not a project problem
-                benign = ("resources still in use at exit", "ObjectDB instances leaked", "at: cleanup (", "at: clear (")
-                kept_lines = [ln for ln in raw_lines if ln.strip() and not any(b in ln for b in benign)]
-                cli_output = "\n".join(kept_lines).strip()
-                seen_msgs: set = set()
-                for li, err_line in enumerate(kept_lines):
-                    if "ERROR:" not in err_line:
-                        continue
-                    msg = err_line.strip()
-                    nxt = kept_lines[li + 1].strip() if li + 1 < len(kept_lines) else ""
-                    if nxt.startswith("at:"):
-                        msg += " " + nxt
-                    if msg in seen_msgs:
-                        continue
-                    seen_msgs.add(msg)
-                    if len(seen_msgs) <= 15:
-                        diagnostics.append({"file": "godot-cli", "severity": "error", "message": msg})
-                cli_exit = proc_sync.returncode if seen_msgs else 0
             except subprocess.TimeoutExpired:
-                cli_output = "Godot headless run did not exit in time (possible infinite loop in a script)."
+                return None, []
+            raw_lines = ((proc_sync.stdout or "") + "\n" + (proc_sync.stderr or "")).splitlines()
+            return proc_sync.returncode, [ln for ln in raw_lines if ln.strip() and not any(bn in ln for bn in benign)]
+
+        def _collect_errors(lines: List[str], source: str, load_failures_only: bool) -> int:
+            found = 0
+            for li, err_line in enumerate(lines):
+                is_error = "ERROR:" in err_line or "Can't run project" in err_line
+                if not is_error:
+                    continue
+                if load_failures_only and not any(mark in err_line for mark in load_failure_marks):
+                    continue
+                msg = err_line.strip()
+                nxt = lines[li + 1].strip() if li + 1 < len(lines) else ""
+                if nxt.startswith("at:"):
+                    msg += " " + nxt
+                if msg in seen_msgs:
+                    continue
+                seen_msgs.add(msg)
+                found += 1
+                if len(seen_msgs) <= 25:
+                    diagnostics.append({"file": source, "severity": "error", "message": msg})
+            return found
+
+        if not godot_exe:
+            diagnostics.append(
+                {
+                    "file": "godot-cli",
+                    "severity": "error",
+                    "message": (
+                        "The Godot executable was not found, so the game was NOT launched and this check "
+                        "cannot confirm that it runs. Tell the user to set GODOT_PATH. Do not claim the game works."
+                    ),
+                }
+            )
+        elif proj_file.exists():
+            try:
+                # 1. Import assets first (textures, audio, .glb), otherwise a never-opened project fails to load them
+                _run_godot(["--import"], 300.0)
+
+                # 2. Launch the game itself: run the main scene for ~90 frames so _ready/_process errors surface
+                exit_code, kept_lines = _run_godot(["--quit-after", "90"], 90.0)
+                godot_ran = True
+                if exit_code is None:
+                    cli_exit = 1
+                    diagnostics.append(
+                        {
+                            "file": "godot-cli",
+                            "severity": "error",
+                            "message": "The game did not exit within 90 seconds when launched headless "
+                            "(possible infinite loop in a script).",
+                        }
+                    )
+                else:
+                    cli_output = "\n".join(kept_lines).strip()
+                    found = _collect_errors(kept_lines, "godot-cli (launching the game)", load_failures_only=False)
+                    if found:
+                        cli_exit = exit_code or 1
+                    elif exit_code != 0:
+                        cli_exit = exit_code
+                        diagnostics.append(
+                            {
+                                "file": "godot-cli",
+                                "severity": "error",
+                                "message": f"Godot exited with code {exit_code} when launching the game: "
+                                + cli_output[-600:],
+                            }
+                        )
+                    else:
+                        launch_notes.append("Launched the game headless (main scene, 90 frames): no errors.")
+
+                # 3. Load every other scene on its own, so scenes the menu never opens are checked too.
+                #    Only load failures count here: a part scene run alone may lack its parent at runtime.
+                main_res = m_scene.group(1) if (proj_file.exists() and m_scene) else ""
+                other_scenes = [sc for sc in checked_scenes if sc.endswith(".tscn") and sc != main_res]
+                deadline = time.time() + 120.0
+                loaded_ok = 0
+                skipped = 0
+                for scene_res in other_scenes:
+                    if time.time() > deadline:
+                        skipped += 1
+                        continue
+                    sc_exit, sc_lines = _run_godot(["--quit-after", "5", scene_res], 40.0)
+                    if sc_exit is None:
+                        diagnostics.append(
+                            {"file": scene_res, "severity": "error", "message": "Scene did not finish loading within 40 seconds."}
+                        )
+                        cli_exit = cli_exit or 1
+                        continue
+                    if _collect_errors(sc_lines, f"godot-cli (loading {scene_res})", load_failures_only=True):
+                        cli_exit = cli_exit or 1
+                    else:
+                        loaded_ok += 1
+                if other_scenes:
+                    note = f"Loaded {loaded_ok} of {len(other_scenes)} other scenes without load errors."
+                    if skipped:
+                        note += f" {skipped} not checked (time limit)."
+                    launch_notes.append(note)
             except Exception as exc:
-                logger.debug(f"Godot headless project check CLI fallback: {exc}")
+                cli_exit = 1
+                diagnostics.append(
+                    {
+                        "file": "godot-cli",
+                        "severity": "error",
+                        "message": f"Could not run Godot to launch the game ({type(exc).__name__}: {exc}). "
+                        "The game was NOT verified to run.",
+                    }
+                )
 
         valid = len(diagnostics) == 0 and cli_exit == 0
         summary_lines = [
             f"Godot 4 Headless Project Validation ({'PASSED - 0 errors' if valid else f'FAILED - {len(diagnostics)} error(s)'})",
             f"Checked {len(checked_scenes)} scene/resource files and {len(checked_scripts)} GDScript files.",
         ]
+        summary_lines.extend(launch_notes)
+        if not godot_ran:
+            summary_lines.append("The game was NOT launched in Godot - this result does not show that it runs.")
         for d in diagnostics:
             loc = f"{d.get('file')}:{d['line']}" if d.get("line") else d.get("file")
             summary_lines.append(f"  ERROR [{loc}]: {d.get('message')}")
@@ -1632,6 +1748,7 @@ class AgentToolExecutor:
             "command": raw_command,
             "exit_code": 0 if valid else 1,
             "valid": valid,
+            "game_launched": godot_ran,
             "checked_scenes": checked_scenes,
             "checked_scripts": checked_scripts,
             "diagnostics": diagnostics,
