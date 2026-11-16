@@ -157,7 +157,18 @@ class ProjectMemoryRAG:
     """
 
     PRE_COMPACTION_FLUSH_THRESHOLD_TOKENS = 25000
-    MAX_FACTS_PER_FLUSH = 8
+    MAX_FACTS_PER_FLUSH = 5
+    # The memory file is pinned into every request, so it has a hard budget.
+    MAX_FACTS_IN_FILE = 40            # newest facts kept on disk
+    PINNED_MEMORY_MAX_CHARS = 5000    # ~1,400 tokens of the prompt, whatever is on disk
+    MIN_SECONDS_BETWEEN_LLM_EXTRACTIONS = 600.0
+    # Words that mark a diagnosis, guess or temporary state rather than a durable project fact
+    _NOT_A_FACT = re.compile(
+        r"\b(reject|rejects|rejected|quirk|cause[sd]?|causing|error|errors|fail|fails|failed|failing|failure|"
+        r"timeout|time[sd]? out|slow|stale|bug|issue|broken|fix|fixed|invalid|missing|crash|re-?import|"
+        r"cache|workaround|problem|unset|removed|no godot|not found|line endings?|crlf)\b",
+        re.IGNORECASE,
+    )
 
     # Regex patterns to detect bulky raw read_file dumps in tool responses or assistant/user turns
     READ_FILE_JSON_RE = re.compile(
@@ -223,9 +234,89 @@ class ProjectMemoryRAG:
             path.write_text(initial_md, encoding="utf-8")
         return path
 
-    def read_pinned_memory_md(self) -> str:
+    @staticmethod
+    def _fact_key(line: str) -> str:
+        return re.sub(r"\s+", " ", line.strip().lstrip("-* ").lower())
+
+    @staticmethod
+    def _fact_label(line: str) -> str:
+        """`**Label**:` prefix of a fact, used so each labelled fact has one current line."""
+        m = re.match(r"\s*-?\s*\*\*([^*]{2,60})\*\*\s*:", line)
+        return m.group(1).strip().lower() if m else ""
+
+    @classmethod
+    def _too_similar(cls, key: str, existing_keys: List[str]) -> bool:
+        words = set(re.findall(r"[a-z0-9_./:]+", key))
+        if not words:
+            return True
+        for other in existing_keys:
+            other_words = set(re.findall(r"[a-z0-9_./:]+", other))
+            if not other_words:
+                continue
+            overlap = len(words & other_words) / max(1, min(len(words), len(other_words)))
+            if overlap >= 0.75:
+                return True
+        return False
+
+    def _split_memory_md(self) -> Tuple[List[str], List[str]]:
+        """Return (header lines, fact lines) of the memory file."""
         self.ensure_memory_md_exists()
-        return self.memory_md_path.read_text(encoding="utf-8", errors="replace").strip()
+        header: List[str] = []
+        facts: List[str] = []
+        for line in self.memory_md_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.strip().startswith("- "):
+                facts.append(line.strip())
+            elif not facts and line.strip():
+                header.append(line.rstrip())
+        return header, facts
+
+    def compact_memory_md(self) -> Dict[str, int]:
+        """
+        Enforce the budget on disk: drop duplicates and near-duplicates, keep one line per
+        `**Label**:`, drop diagnoses/guesses, keep the two baseline facts plus the newest ones.
+        """
+        header, facts = self._split_memory_md()
+        before = len(facts)
+        baseline = [f for f in facts[:2] if self._fact_label(f) in ("engine target", "3d coordinate & physics convention")]
+        kept: List[str] = []
+        kept_keys: List[str] = []
+        seen_labels: set = set()
+        for fact in reversed(facts):  # newest first
+            if fact in baseline:
+                continue
+            key = self._fact_key(fact)
+            label = self._fact_label(fact)
+            if label:
+                if label in seen_labels:
+                    continue
+                seen_labels.add(label)
+            elif self._NOT_A_FACT.search(fact) or self._too_similar(key, kept_keys):
+                continue
+            kept.append(fact)
+            kept_keys.append(key)
+            if len(kept) >= self.MAX_FACTS_IN_FILE - len(baseline):
+                break
+        final = baseline + list(reversed(kept))
+        if final != facts:
+            text = "\n".join(header) + "\n\n" + "\n".join(final) + "\n"
+            self.memory_md_path.write_text(text, encoding="utf-8")
+        return {"before": before, "after": len(final)}
+
+    def read_pinned_memory_md(self) -> str:
+        """The part of the memory file that is pinned into every prompt - always within a fixed budget."""
+        header, facts = self._split_memory_md()
+        if len(facts) > self.MAX_FACTS_IN_FILE:
+            self.compact_memory_md()
+            header, facts = self._split_memory_md()
+        baseline, rest = facts[:2], facts[2:]
+        budget = self.PINNED_MEMORY_MAX_CHARS - sum(len(x) + 1 for x in header + baseline)
+        chosen: List[str] = []
+        for fact in reversed(rest):  # newest first until the budget is used
+            if len(fact) + 1 > budget:
+                continue
+            budget -= len(fact) + 1
+            chosen.append(fact)
+        return ("\n".join(header) + "\n\n" + "\n".join(baseline + list(reversed(chosen)))).strip()
 
     def build_static_system_prompt(self, base_system_prompt: str) -> str:
         """
@@ -462,9 +553,13 @@ class ProjectMemoryRAG:
         extracted_facts: List[str] = []
 
         # 1. If llama-server is running, run a fast deterministic extraction pass at temperature=0.1
-        if llama_alive and combined_text.strip():
+        #    (at most once every few minutes: it costs a model call and the file is pinned in every prompt)
+        now = time.time()
+        last_llm = getattr(self, "_last_llm_extraction_at", 0.0)
+        if llama_alive and combined_text.strip() and now - last_llm >= self.MIN_SECONDS_BETWEEN_LLM_EXTRACTIONS:
+            self._last_llm_extraction_at = now
             llm_facts = await self._extract_facts_via_llama_server(combined_text)
-            extracted_facts.extend(llm_facts)
+            extracted_facts.extend(f for f in llm_facts if not self._NOT_A_FACT.search(f))
 
         # 2. Deterministic rule & AST/regex fact extractor for Godot 4 conventions, paths, & debugging fixes
         deterministic_facts = self._extract_facts_deterministic(combined_text)
@@ -486,9 +581,12 @@ class ProjectMemoryRAG:
     async def _extract_facts_via_llama_server(self, conversation_snippet: str) -> List[str]:
         url = f"http://127.0.0.1:{self.llama_port}/v1/chat/completions"
         prompt = (
-            "Extract up to 8 durable Godot 4 architectural facts, node paths, collision layers/masks, "
-            "autoload names, or API constraints from the following session transcript. "
-            "Output ONLY concise markdown bullet points starting with '- '.\n\n"
+            "From the session transcript below, extract up to 5 durable facts about THIS project that will "
+            "still be true next week: scene and script names and what they are for, node paths, autoload names, "
+            "input action names, collision layers/masks, asset locations, and design decisions the user stated.\n"
+            "Do NOT record: error messages, diagnoses or guesses about what is wrong, things that failed, "
+            "what was just fixed, temporary state, or general Godot knowledge.\n"
+            "Output ONLY concise markdown bullet points starting with '- '. If nothing qualifies, output NONE.\n\n"
             f"{conversation_snippet[-6000:]}"
         )
         payload = {
@@ -497,7 +595,7 @@ class ProjectMemoryRAG:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 1200,
+            "max_tokens": 500,
         }
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
@@ -521,7 +619,12 @@ class ProjectMemoryRAG:
         facts: List[str] = []
 
         # 1. res:// asset/script/scene paths
-        res_paths = sorted(set(re.findall(r"res://[A-Za-z0-9_/\.\-]+\.[a-z0-9]+", text)))
+        res_paths = sorted(
+            p_
+            for p_ in set(re.findall(r"res://[A-Za-z0-9_/\.\-]+\.[a-z0-9]+", text))
+            if "/.godot/" not in p_ and "/.harness" not in p_ and not p_.rsplit("/", 1)[-1].startswith("_")
+            and not p_.endswith((".bak", ".import", ".uid", ".py"))
+        )
         if res_paths:
             facts.append(f"**Project Resources**: {', '.join(f'`{p}`' for p in res_paths[:6])}")
 
@@ -566,32 +669,39 @@ class ProjectMemoryRAG:
         return facts[: cls.MAX_FACTS_PER_FLUSH]
 
     def _append_deduplicated_facts_to_memory_md(self, facts: List[str]) -> List[str]:
-        """Append new facts to `.harness/MEMORY.md` only if not already present."""
-        self.ensure_memory_md_exists()
-        existing_text = self.memory_md_path.read_text(encoding="utf-8", errors="replace")
-        existing_lines_norm = {
-            re.sub(r"\s+", " ", line.strip().lstrip("-* ").lower())
-            for line in existing_text.splitlines()
-            if line.strip()
-        }
-
+        """
+        Add new facts to `.harness/MEMORY.md`. A fact with a `**Label**:` replaces the existing line
+        with that label; other facts are added only if nothing similar is already there. The file is
+        then trimmed to its budget, so it can never grow without bound.
+        """
+        header, existing = self._split_memory_md()
+        existing_keys = [self._fact_key(f) for f in existing]
         appended: List[str] = []
         for fact in facts:
             clean_fact = fact.strip().lstrip("-* ").strip()
             if not clean_fact:
                 continue
-            norm_fact = re.sub(r"\s+", " ", clean_fact.lower())
-            if norm_fact not in existing_lines_norm:
-                existing_lines_norm.add(norm_fact)
-                appended.append(clean_fact)
+            line = f"- {clean_fact}"
+            key = self._fact_key(line)
+            label = self._fact_label(line)
+            if label:
+                same = [i for i, f in enumerate(existing) if self._fact_label(f) == label]
+                if same:
+                    if existing_keys[same[0]] == key:
+                        continue
+                    for i in reversed(same):
+                        del existing[i]
+                        del existing_keys[i]
+            elif key in existing_keys or self._too_similar(key, existing_keys):
+                continue
+            existing.append(line)
+            existing_keys.append(key)
+            appended.append(clean_fact)
 
         if appended:
-            new_block = "\n".join(f"- {f}" for f in appended) + "\n"
-            with open(self.memory_md_path, "a", encoding="utf-8") as mf:
-                if not existing_text.endswith("\n"):
-                    mf.write("\n")
-                mf.write(new_block)
-
+            text = "\n".join(header) + "\n\n" + "\n".join(existing) + "\n"
+            self.memory_md_path.write_text(text, encoding="utf-8")
+            self.compact_memory_md()
         return appended
 
     # -------------------------------------------------------------------------

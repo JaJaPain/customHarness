@@ -24,6 +24,8 @@ from godot_parser import GodotParser
 from image_gen_worker import ImageGenWorker
 from memory_rag import ProjectMemoryRAG
 
+from godot_reference import GodotReference
+
 logger = logging.getLogger("CustomHarness.AgentTools")
 
 
@@ -414,6 +416,55 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "godot_docs",
+            "description": (
+                "Look things up in the offline Godot reference for the installed engine version. "
+                "Use it BEFORE writing a class, property, method or signal you are not certain exists, and "
+                "before writing your first scene file. Queries: a class name (\"CharacterBody3D\") lists its "
+                "properties, methods and signals; \"Class.member\" (\"TextureRect.texture\") checks one member; "
+                "\"tscn\" returns the rules and a correct example for .tscn scene files; \"tres\" for .tres files."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Class name, Class.member, or a guide name (tscn, tres)."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_task_list",
+            "description": (
+                "Keep a checklist for multi-step work. Call it once at the start with every step of the job, "
+                "then call it again with the whole list whenever a step is finished (done: true) or the plan "
+                "changes. The list is shown to the user and repeated back to you every step so you stay on track."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "description": "The complete list, in order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string", "description": "Short description of the step."},
+                                "done": {"type": "boolean", "description": "true once the step is finished and verified."},
+                            },
+                            "required": ["text"],
+                        },
+                    },
+                },
+                "required": ["tasks"],
+            },
+        },
+    },
 ]
 
 
@@ -561,6 +612,10 @@ class AgentToolExecutor:
         self._diff_history: List[Dict[str, Any]] = []
         self._pending_commands: Dict[str, Dict[str, Any]] = {}
         self._cached_godot_exe: Optional[str] = None
+        self.task_list: List[Dict[str, Any]] = []
+        self.godot_reference = GodotReference(
+            Path(__file__).resolve().parent / "cache" / "godot_docs", self.detect_godot_executable
+        )
 
     def set_workspace_dir(self, new_workspace: str | Path) -> Path:
         """Switch the active Godot 4 project workspace directory across all tool workers."""
@@ -734,6 +789,10 @@ class AgentToolExecutor:
                     query=str(arguments.get("query", "")),
                     top_k=int(arguments.get("top_k", 4)),
                 )
+            if tool_name == "godot_docs":
+                return await asyncio.to_thread(self.godot_reference.lookup, str(arguments.get("query", "")))
+            if tool_name == "update_task_list":
+                return self.tool_update_task_list(arguments.get("tasks") or [])
             if tool_name == "generate_game_audio":
                 if self.audio_worker is None:
                     return {
@@ -1037,8 +1096,11 @@ class AgentToolExecutor:
 
         # Automatic Godot --check-only validation if target is a .gd script
         gd_validation = None
+        godot_check = None
         if target.suffix.lower() == ".gd":
             gd_validation = await self.validate_gdscript(target)
+        elif target.suffix.lower() == ".tscn":
+            godot_check = await asyncio.to_thread(self.godot_load_check, target)
 
         return {
             "status": "success",
@@ -1050,6 +1112,7 @@ class AgentToolExecutor:
             "lines_added": diff_record["lines_added"],
             "lines_removed": diff_record["lines_removed"],
             "gdscript_validation": gd_validation,
+            "godot_load_check": godot_check,
         }
 
     _LINE_NUMBER_PREFIX_RE = re.compile(r"^\s*\d+\s\|\s?")
@@ -1257,6 +1320,9 @@ class AgentToolExecutor:
             gd_validation = await self.validate_gdscript(target)
         elif target.suffix.lower() in (".tscn", ".tres"):
             scene_validation = self.validate_scene_or_resource_file(target)
+        godot_check = None
+        if target.suffix.lower() == ".tscn":
+            godot_check = await asyncio.to_thread(self.godot_load_check, target)
 
         return {
             "status": "success",
@@ -1269,6 +1335,168 @@ class AgentToolExecutor:
             "lines_removed": diff_record["lines_removed"],
             "gdscript_validation": gd_validation,
             "scene_validation": scene_validation,
+            "godot_load_check": godot_check,
+        }
+
+    # -------------------------------------------------------------------------
+    # Task list (update_task_list) and per-file Godot load check
+    # -------------------------------------------------------------------------
+    def tool_update_task_list(self, tasks: List[Any]) -> Dict[str, Any]:
+        cleaned: List[Dict[str, Any]] = []
+        for item in tasks[:40]:
+            if isinstance(item, str):
+                item = {"text": item}
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or item.get("content") or item.get("task") or "").strip()
+            if text:
+                cleaned.append({"text": text[:200], "done": bool(item.get("done", False))})
+        if not cleaned:
+            return {"status": "error", "tool": "update_task_list", "error": "tasks must be a non-empty list of {text, done}."}
+        self.task_list = cleaned
+        done = sum(1 for t in cleaned if t["done"])
+        return {
+            "status": "success",
+            "tasks": cleaned,
+            "summary": f"{done} of {len(cleaned)} steps done.",
+            "next_step": next((t["text"] for t in cleaned if not t["done"]), None),
+        }
+
+    def render_task_list(self) -> str:
+        return "\n".join(f"[{'x' if t['done'] else ' '}] {t['text']}" for t in self.task_list)
+
+    _ERR_FILE_LINE_RE = re.compile(r"(res://[^\s:\]\)]+):(\d+)")
+
+    def _autoload_names(self) -> Dict[str, str]:
+        """Autoload name -> raw value from project.godot's [autoload] section."""
+        proj = self.workspace_dir / "project.godot"
+        names: Dict[str, str] = {}
+        if not proj.exists():
+            return names
+        section = ""
+        for line in proj.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("["):
+                section = line
+            elif section == "[autoload]" and "=" in line:
+                key, _, val = line.partition("=")
+                names[key.strip()] = val.strip().strip('"')
+        return names
+
+    def _explain_godot_error(self, message: str) -> str:
+        """Plain-language cause and fix for a Godot error line, based on the file and line it names."""
+        hints: List[str] = []
+        m = self._ERR_FILE_LINE_RE.search(message)
+        line_text = ""
+        file_text = ""
+        if m:
+            try:
+                target = self.resolve_workspace_path(m.group(1))
+                file_lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+                file_text = "\n".join(file_lines)
+                line_no = int(m.group(2))
+                if 1 <= line_no <= len(file_lines):
+                    line_text = file_lines[line_no - 1].strip()
+                    hints.append(f"Line {line_no} of {m.group(1)} is: {line_text[:160]}")
+            except Exception:
+                pass
+
+        if line_text and m and m.group(1).endswith((".tscn", ".tres")):
+            if re.search(r"\.new\(|\bload\(|\bpreload\(", line_text):
+                hints.append("CAUSE: a scene file is data, not code - calls like .new() / load() are not allowed. "
+                             "Declare the file as an [ext_resource] (or make a [sub_resource]) and reference it.")
+            sub = re.search(r'SubResource\(\s*"([^"]+)"\s*\)', line_text)
+            if sub:
+                decl = re.search(r'\[sub_resource[^\]]*id="' + re.escape(sub.group(1)) + '"', file_text)
+                first_node = file_text.find("[node ")
+                if not decl:
+                    hints.append(f'CAUSE: SubResource("{sub.group(1)}") is used but no [sub_resource ... id="{sub.group(1)}"] block exists. Add one above the first [node].')
+                elif first_node != -1 and decl.start() > first_node:
+                    hints.append(f'CAUSE: the [sub_resource ... id="{sub.group(1)}"] block is BELOW the nodes. '
+                                 "Move every [sub_resource] block above the first [node] block (order: ext_resource, sub_resource, node, connection).")
+            ext = re.search(r'ExtResource\(\s*"([^"]+)"\s*\)', line_text)
+            if ext and not re.search(r'\[ext_resource[^\]]*id="' + re.escape(ext.group(1)) + '"', file_text):
+                hints.append(f'CAUSE: ExtResource("{ext.group(1)}") is used but no [ext_resource ... id="{ext.group(1)}"] line declares it.')
+        ident = re.search(r'Identifier "([A-Za-z0-9_]+)" not declared', message)
+        if ident:
+            autoloads = self._autoload_names()
+            name = ident.group(1)
+            if name in autoloads and not autoloads[name].startswith("*"):
+                hints.append(f'CAUSE: the autoload {name} is registered without the leading * in project.godot. '
+                             f'In the [autoload] section it must read: {name}="*{autoloads[name]}" (the * makes it a global singleton).')
+            elif name not in autoloads:
+                hints.append(f"CAUSE: {name} is not defined. If it should be a global, add it to project.godot under [autoload] as "
+                             f'{name}="*res://path/to/script.gd".')
+        if "referenced non-existent resource" in message:
+            hints.append("CAUSE: the referenced file is missing or itself failed to load - fix that file first and this error goes away.")
+        return (" || " + " ".join(hints)) if hints else ""
+
+    @staticmethod
+    def _is_engine_noise(line: str) -> bool:
+        return 'ERROR: Condition "' in line or "ERROR: Cannot set object script" in line
+
+    _SCENE_LOAD_FAILURE_MARKS = (
+        "Parse Error", "Parse error", "Failed loading resource", "Failed loading scene",
+        "Failed to load script", "Compile Error", "Cannot open file", "Failed to instantiate",
+    )
+
+    def godot_load_check(self, scene_path: Path) -> Optional[Dict[str, Any]]:
+        """
+        Load one .tscn in Godot right after it was written, so a broken scene is reported while it is
+        still fresh. Returns None when the check cannot run (no Godot, no project.godot).
+        """
+        godot_exe = self.detect_godot_executable()
+        if not godot_exe or not (self.workspace_dir / "project.godot").exists():
+            return None
+        res_scene = self.to_res_path(scene_path)
+
+        def _run(extra: List[str], limit: float) -> List[str]:
+            proc = subprocess.run(
+                [godot_exe, "--headless", "--path", str(self.workspace_dir), *extra],
+                cwd=str(self.workspace_dir), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=limit,
+            )
+            return ((proc.stdout or "") + "\n" + (proc.stderr or "")).splitlines()
+
+        def _errors(lines: List[str]) -> List[str]:
+            found: List[str] = []
+            seen_keys: set = set()
+            for li, line in enumerate(lines):
+                if "ERROR:" not in line or self._is_engine_noise(line):
+                    continue
+                if not any(mark in line for mark in self._SCENE_LOAD_FAILURE_MARKS):
+                    continue
+                msg = line.strip()
+                nxt = lines[li + 1].strip() if li + 1 < len(lines) else ""
+                if nxt.startswith("at:") and "res://" in nxt:
+                    msg += " " + nxt
+                key = re.sub(r":\d+", "", msg)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                found.append(msg + self._explain_godot_error(msg))
+            return found[:8]
+
+        try:
+            errors = _errors(_run(["--quit-after", "3", res_scene], 40.0))
+            if errors and any("import" in e.lower() for e in errors):
+                _run(["--import"], 240.0)  # assets not imported yet: import once, then look again
+                errors = _errors(_run(["--quit-after", "3", res_scene], 40.0))
+        except subprocess.TimeoutExpired:
+            return {"loads_in_godot": False, "errors": ["Godot did not finish loading this scene within 40 seconds."]}
+        except Exception as exc:
+            logger.debug(f"godot_load_check skipped: {exc}")
+            return None
+        if not errors:
+            return {"loads_in_godot": True, "errors": []}
+        return {
+            "loads_in_godot": False,
+            "errors": errors,
+            "what_to_do": (
+                "This scene does NOT load in Godot. Fix it now, before writing anything else. A 'Parse Error' "
+                "names the exact line: read that line and correct it (call godot_docs(\"tscn\") for the rules). "
+                "A 'Failed loading resource' for a file you have not created yet just means: create that file next."
+            ),
         }
 
     # -------------------------------------------------------------------------
@@ -1308,7 +1536,9 @@ class AgentToolExecutor:
         # scene/resource/GDScript verification even when `godot` is not on the system PATH.
         cmd_stripped = command.strip()
         cmd_lower = cmd_stripped.lower()
-        if re.match(r"^(?:godot4?|\"[^\"]*godot[^\"]*\")\b", cmd_lower) and "--headless" in cmd_lower:
+        if re.search(r"(?:^|[\s&|;(\"'])(?:godot4?|[^\s\"']*godot[^\s\"']*\.exe)\b", cmd_lower) and "--headless" in cmd_lower:
+            # Whatever is wrapped around it (cd elsewhere, rm of caches, pipes), a headless Godot run
+            # always means "check THIS project": run the real validator in the project folder.
             # Runs Godot several times (import, launch, each scene): keep the server responsive meanwhile
             return await asyncio.to_thread(
                 lambda: asyncio.run(self.validate_godot_project(raw_command=cmd_stripped, timeout_sec=timeout_sec))
@@ -1444,6 +1674,85 @@ class AgentToolExecutor:
         declared_ext_ids = set(parsed.get("ext_resources", {}).keys())
         declared_sub_ids = set(parsed.get("sub_resources", {}).keys())
 
+        # Mistakes Godot accepts silently (the scene "loads" but the node does nothing):
+        ext_types = {
+            m.group(2): m.group(1)
+            for m in re.finditer(r'\[ext_resource[^\]]*?type="([^"]+)"[^\]]*?id="([^"]+)"', content)
+        }
+        ext_types.update(
+            {m.group(1): m.group(2) for m in re.finditer(r'\[ext_resource[^\]]*?id="([^"]+)"[^\]]*?type="([^"]+)"', content)}
+        )
+        node_header = ""
+        for line_no, raw_line in enumerate(content.splitlines(), start=1):
+            line = raw_line.strip()
+            if line.startswith("["):
+                node_header = line if line.startswith("[node ") else ""
+                m_hdr_script = re.search(r'\bscript\s*=\s*ExtResource\(\s*"([^"]+)"\s*\)', node_header)
+                if m_hdr_script:
+                    hdr_name = re.search(r'name="([^"]+)"', node_header)
+                    errors.append(
+                        {
+                            "file": res_file,
+                            "line": line_no,
+                            "severity": "error",
+                            "message": (
+                                f"Node {hdr_name.group(1) if hdr_name else '?'}: 'script=ExtResource(...)' is inside the node header, "
+                                "where Godot ignores it, so the script is NOT attached. Remove it from the header and put it on "
+                                f'its own line directly under the header: script = ExtResource("{m_hdr_script.group(1)}"). '
+                                "(Only name, type, parent and instance belong in the header.)"
+                            ),
+                        }
+                    )
+                continue
+            if not node_header:
+                continue
+            m_script = re.match(r'script\s*=\s*ExtResource\(\s*"([^"]+)"\s*\)', line)
+            if m_script and ext_types.get(m_script.group(1)) not in (None, "Script"):
+                errors.append(
+                    {
+                        "file": res_file,
+                        "line": line_no,
+                        "severity": "error",
+                        "message": (
+                            f'script = ExtResource("{m_script.group(1)}") points at a {ext_types[m_script.group(1)]}, '
+                            "not a script, so this node runs no script. Add an [ext_resource type=\"Script\" "
+                            'path="res://scripts/....gd" id="..."] line and reference that id.'
+                        ),
+                    }
+                )
+            m_inst = re.match(r'instance\s*=\s*ExtResource\(\s*"([^"]+)"\s*\)', line)
+            if m_inst:
+                node_name = re.search(r'name="([^"]+)"', node_header)
+                nm = node_name.group(1) if node_name else "Name"
+                errors.append(
+                    {
+                        "file": res_file,
+                        "line": line_no,
+                        "severity": "error",
+                        "message": (
+                            f"Node {nm}: 'instance=ExtResource(...)' is written as a property line, which Godot ignores, "
+                            "so the scene is NOT placed. It must be inside the square brackets of the node header, and the "
+                            f'header must not have type=. Replace the header with: [node name="{nm}" parent="." '
+                            f'instance=ExtResource("{m_inst.group(1)}")] and delete this line.'
+                        ),
+                    }
+                )
+            m_res = re.match(r'resource\s*=\s*ExtResource\(\s*"([^"]+)"\s*\)', line)
+            if m_res and "instance=" not in node_header and ext_types.get(m_res.group(1), "PackedScene") == "PackedScene":
+                node_name = re.search(r'name="([^"]+)"', node_header)
+                errors.append(
+                    {
+                        "file": res_file,
+                        "line": line_no,
+                        "severity": "error",
+                        "message": (
+                            f"Node {node_name.group(1) if node_name else '?'} does not place anything: 'resource = ExtResource(...)' "
+                            "is not how a scene is instanced. Put the reference in the node header (with no type=) and delete this line: "
+                            f'[node name="{node_name.group(1) if node_name else "Name"}" parent="." instance=ExtResource("{m_res.group(1)}")]'
+                        ),
+                    }
+                )
+
         for ext_id, ext_info in parsed.get("ext_resources", {}).items():
             ext_res_path = ext_info.get("path", "")
             if ext_res_path.startswith("res://"):
@@ -1466,6 +1775,23 @@ class AgentToolExecutor:
                         }
                     )
 
+        if file_path.suffix.lower() == ".tscn":
+            placed_ids = set(re.findall(r'\[node[^\]]*instance=ExtResource\(\s*"([^"]+)"\s*\)', content))
+            for ext_id, ext_type in ext_types.items():
+                if ext_type == "PackedScene" and ext_id not in placed_ids:
+                    ext_path = (parsed.get("ext_resources", {}).get(ext_id) or {}).get("path", "")
+                    errors.append(
+                        {
+                            "file": res_file,
+                            "severity": "error",
+                            "message": (
+                                f'Scene {ext_path} (id="{ext_id}") is declared but never placed in this scene. '
+                                f'Place it with a node header like [node name="Name" parent="." instance=ExtResource("{ext_id}")], '
+                                "or remove the [ext_resource] line if it is not needed."
+                            ),
+                        }
+                    )
+
         for ref_id in re.findall(r'ExtResource\(\s*"([^"]+)"\s*\)', content):
             if ref_id not in declared_ext_ids:
                 errors.append(
@@ -1485,6 +1811,18 @@ class AgentToolExecutor:
                         "message": f"Undeclared SubResource(\"{ref_id}\") referenced in {res_file}",
                     }
                 )
+
+        # The same mistake on many nodes: explain it once, then just list the other lines
+        seen_kinds: Dict[str, int] = {}
+        for err in errors:
+            m_kind = re.match(r"Node [^:]+?(: 'instance=| does not place anything)", str(err.get("message", "")))
+            if not m_kind:
+                continue
+            kind = m_kind.group(1)
+            seen_kinds[kind] = seen_kinds.get(kind, 0) + 1
+            if seen_kinds[kind] > 1:
+                node_nm = str(err["message"]).split(":", 1)[0].replace(" does not place anything", "")
+                err["message"] = f"{node_nm}: the same mistake as the first one reported for this scene - fix it the same way."
 
         return {
             "file": res_file,
@@ -1553,6 +1891,20 @@ class AgentToolExecutor:
                         }
                     )
 
+        for auto_name, auto_val in self._autoload_names().items():
+            if not auto_val.startswith("*"):
+                diagnostics.append(
+                    {
+                        "file": "res://project.godot",
+                        "severity": "error",
+                        "message": (
+                            f'Autoload {auto_name} is missing the leading *. In the [autoload] section write '
+                            f'{auto_name}="*{auto_val}" - without the * the script is not a global and '
+                            f'every use of {auto_name} fails with "Identifier not declared".'
+                        ),
+                    }
+                )
+
         for fpath in sorted(self.workspace_dir.rglob("*")):
             if not fpath.is_file():
                 continue
@@ -1591,6 +1943,37 @@ class AgentToolExecutor:
                                 }
                             )
 
+        # Scripts that nothing attaches or loads never run - usually a scene forgot `script = ExtResource(...)`
+        try:
+            project_files = [
+                f for f in self.workspace_dir.rglob("*")
+                if f.is_file() and f.suffix.lower() in (".tscn", ".tres", ".gd", ".godot")
+                and not any(part.startswith(".") for part in f.relative_to(self.workspace_dir).parts)
+            ]
+            texts = {f: f.read_text(encoding="utf-8", errors="replace") for f in project_files}
+            for gd in [f for f in project_files if f.suffix.lower() == ".gd"]:
+                res_gd = self.to_res_path(gd)
+                if re.search(r"^\s*class_name\s+\w+", texts[gd], flags=re.MULTILINE):
+                    continue
+                if not any(res_gd in text for other, text in texts.items() if other != gd):
+                    same_name_scene = next(
+                        (self.to_res_path(f) for f in project_files if f.suffix.lower() == ".tscn" and f.stem == gd.stem), None
+                    )
+                    where = f" It looks like it belongs on the root node of {same_name_scene}." if same_name_scene else ""
+                    diagnostics.append(
+                        {
+                            "file": res_gd,
+                            "severity": "error",
+                            "message": (
+                                f"{res_gd} is not attached to any scene and not loaded anywhere, so its code never runs.{where} "
+                                f'Attach it: add [ext_resource type="Script" path="{res_gd}" id="..."] to the scene and '
+                                'put script = ExtResource("...") on the node.'
+                            ),
+                        }
+                    )
+        except Exception as exc:
+            logger.debug(f"unused-script check skipped: {exc}")
+
         godot_exe = self.detect_godot_executable()
         cli_output = ""
         cli_exit = 0
@@ -1627,20 +2010,23 @@ class AgentToolExecutor:
             found = 0
             for li, err_line in enumerate(lines):
                 is_error = "ERROR:" in err_line or "Can't run project" in err_line
-                if not is_error:
+                if not is_error or self._is_engine_noise(err_line):
                     continue
                 if load_failures_only and not any(mark in err_line for mark in load_failure_marks):
                     continue
                 msg = err_line.strip()
                 nxt = lines[li + 1].strip() if li + 1 < len(lines) else ""
-                if nxt.startswith("at:"):
+                if nxt.startswith("at:") and "res://" in nxt:
                     msg += " " + nxt
-                if msg in seen_msgs:
+                key = re.sub(r":\d+", "", msg)  # the same problem on many lines is one problem
+                if key in seen_msgs:
                     continue
-                seen_msgs.add(msg)
+                seen_msgs.add(key)
                 found += 1
                 if len(seen_msgs) <= 25:
-                    diagnostics.append({"file": source, "severity": "error", "message": msg})
+                    diagnostics.append(
+                        {"file": source, "severity": "error", "message": msg + self._explain_godot_error(msg)}
+                    )
             return found
 
         if not godot_exe:
@@ -1695,20 +2081,34 @@ class AgentToolExecutor:
                 main_res = m_scene.group(1) if (proj_file.exists() and m_scene) else ""
                 other_scenes = [sc for sc in checked_scenes if sc.endswith(".tscn") and sc != main_res]
                 deadline = time.time() + 120.0
+                gd_texts = []
+                for gd_file in self.workspace_dir.rglob("*.gd"):
+                    if not any(part.startswith(".") for part in gd_file.relative_to(self.workspace_dir).parts):
+                        try:
+                            gd_texts.append(gd_file.read_text(encoding="utf-8", errors="replace"))
+                        except Exception:
+                            pass
                 loaded_ok = 0
                 skipped = 0
                 for scene_res in other_scenes:
                     if time.time() > deadline:
                         skipped += 1
                         continue
-                    sc_exit, sc_lines = _run_godot(["--quit-after", "5", scene_res], 40.0)
+                    # A scene that scripts switch to (change_scene_to_file etc.) is a full screen of the game:
+                    # run it for real and count runtime errors too. Part scenes are only checked for loading.
+                    is_screen = any(scene_res in gd_text for gd_text in gd_texts)
+                    sc_exit, sc_lines = _run_godot(["--quit-after", "40" if is_screen else "5", scene_res], 40.0)
                     if sc_exit is None:
                         diagnostics.append(
                             {"file": scene_res, "severity": "error", "message": "Scene did not finish loading within 40 seconds."}
                         )
                         cli_exit = cli_exit or 1
                         continue
-                    if _collect_errors(sc_lines, f"godot-cli (loading {scene_res})", load_failures_only=True):
+                    if _collect_errors(
+                        sc_lines,
+                        f"godot-cli ({'running' if is_screen else 'loading'} {scene_res})",
+                        load_failures_only=not is_screen,
+                    ):
                         cli_exit = cli_exit or 1
                     else:
                         loaded_ok += 1
@@ -1734,6 +2134,11 @@ class AgentToolExecutor:
             f"Checked {len(checked_scenes)} scene/resource files and {len(checked_scripts)} GDScript files.",
         ]
         summary_lines.extend(launch_notes)
+        if not valid:
+            summary_lines.append(
+                "These errors come from running Godot on the files on disk just now - nothing is cached. "
+                "Fix the FIRST error first; several of the later ones are usually caused by it."
+            )
         if not godot_ran:
             summary_lines.append("The game was NOT launched in Godot - this result does not show that it runs.")
         for d in diagnostics:

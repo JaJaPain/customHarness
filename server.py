@@ -325,7 +325,7 @@ BASE_SYSTEM_PROMPT = """You are a local Godot 4 game-development agent running i
 HOW TO WORK
 1. Understand the request. If the user reports a bug or shows a screenshot, the problem is in THIS project - investigate it; never answer with a generic capability summary.
 2. Look before you change: use list_dir / grep_search / read_file to inspect the relevant scenes (.tscn), scripts (.gd) and project.godot. Each user message ends with an up-to-date list of the project files.
-3. Make the change with apply_diff (small targeted edits; search_text must match the file exactly) or write_file (new files / full rewrites).
+3. Make the change with apply_diff (small targeted edits; search_text must match the file exactly) or write_file (new files / full rewrites). Every scene you write is loaded in Godot straight away: if the result says loads_in_godot is false, fix that scene before doing anything else.
 4. Verify: after editing, call run_command with `godot --headless --quit` to validate the whole project, read any errors, and fix them. Do not say something works unless a tool result shows it.
 5. Finish with a short plain-language summary: what was wrong, what you changed (file paths), and anything the user should test by hand.
 
@@ -333,6 +333,9 @@ RULES
 - All paths are Godot `res://` paths relative to the project root.
 - Target Godot 4.x / GDScript 2.0 (`@export`, `@onready`, `CharacterBody3D`, `signal.connect(callable)`, `await`). Never use Godot 3 syntax.
 - Every input action a script uses (Input.is_action_pressed etc.) must be bound to keys with the set_input_action tool - never hand-edit the [input] section of project.godot. An action with empty events never fires. Scripts must also be attached to nodes in the scene, or nothing happens at runtime.
+- For any job with more than two steps, call update_task_list first with all the steps, and call it again as each one is finished. Work through the list in order.
+- Do not guess Godot APIs or file formats: call godot_docs("ClassName") to check a class, property or method, and godot_docs("tscn") before writing your first scene file. A .tscn file is data - never write code such as `.new()` in it.
+- When Godot reports an error with a file and line number, that line is the problem: read it and fix it. Do not blame line endings, caches or re-imports, and never wait or sleep for a re-import.
 - Keep working with tools until the task is done; do not stop after only reading a file. If you are blocked, say exactly what is blocking you.
 - Earlier turns of this conversation are real: when the user says "it", "the game", or "that", they mean the project and work discussed above.
 
@@ -582,6 +585,7 @@ def _start_new_conversation() -> None:
     """Open a blank conversation (it is only written to disk once something is said)."""
     global _last_project_context_sig
     _last_project_context_sig = None
+    tool_executor.task_list = []
     ACTIVE_CONVERSATION.update(
         id=_new_conversation_id(),
         title="New conversation",
@@ -600,6 +604,7 @@ def _open_conversation(conv_id: str) -> bool:
     path = _conversations_dir() / f"{conv_id}.json"
     if not path.exists():
         return False
+    tool_executor.task_list = []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -833,18 +838,36 @@ async def _call_llm(
         raise LLMUnavailableError(orchestrator.describe_llm_unavailable())
 
     url = f"http://127.0.0.1:{orchestrator.llama_port}/v1/chat/completions"
+    api_messages = _messages_for_api(messages)
+    if tool_executor.task_list:
+        # Repeated at the end of every request so the model keeps its place; not saved in the history,
+        # so it costs a few tokens per step instead of piling up.
+        api_messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "[Automatic reminder - your task list. Do the first unchecked step next; "
+                    "call update_task_list when a step is finished.]\n" + tool_executor.render_task_list()
+                ),
+            }
+        )
     payload = {
         "model": orchestrator.active_profile.model_filename,
-        "messages": _messages_for_api(messages),
+        "messages": api_messages,
         "tools": TOOL_DEFINITIONS,
         "temperature": 0.2,
         "max_tokens": 8192,
     }
     payload["stream"] = True
-    return await _stream_chat_completion(url, payload, step_index)
+    payload["stream_options"] = {"include_usage": True}
+    raw_estimate = orchestrator.estimate_turn_tokens(api_messages, TOOL_DEFINITIONS)
+    result = await _stream_chat_completion(url, payload, step_index)
+    _record_real_prompt_tokens(raw_estimate, _LAST_STREAM_USAGE.get("prompt_tokens", 0))
+    return result
 
 
 _STREAM_FLUSH_INTERVAL_SEC = 0.08
+_LAST_STREAM_USAGE: Dict[str, int] = {}
 
 # Repetition watchdog for streamed thinking / answer text (never applied to tool-call arguments,
 # where repeated lines are normal file content).
@@ -902,6 +925,7 @@ async def _stream_chat_completion(
     """
     content_parts: List[str] = []
     reasoning_parts: List[str] = []
+    _LAST_STREAM_USAGE.clear()
     calls: Dict[int, Dict[str, str]] = {}
     finish_reason = "stop"
     pending = {"content": "", "reasoning": ""}
@@ -977,6 +1001,10 @@ async def _stream_chat_completion(
                         if "context" in err_text.lower():
                             raise LLMContextOverflowError(err_text)
                         raise LLMUnavailableError(f"llama-server reported an error while generating: {err_text}")
+                    if isinstance(chunk.get("usage"), dict):
+                        _LAST_STREAM_USAGE.update(
+                            {k: int(v) for k, v in chunk["usage"].items() if isinstance(v, (int, float))}
+                        )
                     choices = chunk.get("choices") or []
                     if not choices:
                         continue
@@ -997,7 +1025,7 @@ async def _stream_chat_completion(
                             slot["name"] += fn["name"]
                         if fn.get("arguments"):
                             slot["args"] += fn["arguments"]
-                        tool_progress = {"name": slot["name"], "chars": len(slot["args"])}
+                        tool_progress = {"name": slot["name"], "chars": len(slot["args"]), "tail": slot["args"][-700:]}
                     if choice.get("finish_reason"):
                         finish_reason = choice["finish_reason"]
                     await flush()
@@ -1069,8 +1097,21 @@ _FILE_TOOLS = ("write_file", "apply_diff", "set_input_action", "generate_2d_asse
 _SUMMARY_MARK = "[Context summary - earlier messages were condensed to save memory"
 
 
+# The character-based estimate is corrected by the real prompt size the model server reports.
+_TOKEN_CALIBRATION = {"ratio": 1.0, "last_real_prompt_tokens": 0}
+
+
 def _estimate_history_tokens(history: List[Dict[str, Any]]) -> int:
-    return orchestrator.estimate_turn_tokens(history, TOOL_DEFINITIONS)
+    return int(orchestrator.estimate_turn_tokens(history, TOOL_DEFINITIONS) * _TOKEN_CALIBRATION["ratio"])
+
+
+def _record_real_prompt_tokens(estimated: int, real: int) -> None:
+    if estimated <= 0 or real <= 0:
+        return
+    ratio = max(0.7, min(4.0, real / estimated))
+    # move most of the way to the new measurement, keep a little smoothing
+    _TOKEN_CALIBRATION["ratio"] = round(0.3 * _TOKEN_CALIBRATION["ratio"] + 0.7 * ratio, 3)
+    _TOKEN_CALIBRATION["last_real_prompt_tokens"] = real
 
 
 def _message_text(m: Dict[str, Any]) -> str:
@@ -1220,6 +1261,8 @@ def _build_task_preserving_history(history: List[Dict[str, Any]], current_reques
     if files:
         parts += ["## Files created or changed so far (they exist on disk - do not recreate them blindly)"]
         parts += [f"- {f}" for f in files[-80:]]
+    if tool_executor.task_list:
+        parts += ["## Your task list ([x] = done)", tool_executor.render_task_list()]
     parts += ["## Latest project validation result", (last_validation.strip()[:1800] or "(the project has not been validated yet)")]
     if progress:
         parts += ["## Your most recent steps before this summary"] + [f"- {s_}" for s_ in progress[-12:]]
@@ -1276,6 +1319,8 @@ _MAX_TOOL_RESULT_CHARS = 14000
 
 def _format_tool_result_for_model(tool_name: str, result: Dict[str, Any]) -> str:
     """Render a tool result the way a small model reads best: plain text for files, trimmed JSON otherwise."""
+    if tool_name == "godot_docs" and result.get("status") == "success":
+        return str(result.get("text") or "")[:_MAX_TOOL_RESULT_CHARS]
     if tool_name == "read_file" and result.get("status") == "success":
         header = (
             f"[read_file {result.get('res_path')} lines {result.get('start_line')}-{result.get('end_line')} "
@@ -1397,6 +1442,7 @@ async def _run_agent_turn_locked(
     overflow_triggered = False
     overflow_retries = 0
     condensed_this_turn = False
+    condense_floor = 0
     nudges_in_a_row = 0
     error_text: Optional[str] = None
     hit_step_limit = False
@@ -1416,11 +1462,16 @@ async def _run_agent_turn_locked(
         await ws_manager.broadcast("step_start", {"step": step_idx, "max_steps": max_steps})
 
         # Keep the conversation inside the fast context: condense before it overflows, as often as needed
-        if not _scripted_demo_enabled() and _estimate_history_tokens(CONVERSATION_HISTORY) > CONTEXT_SOFT_LIMIT_TOKENS:
+        # (After a full condensing the trigger moves up to what was achieved plus headroom, so a prompt
+        #  whose fixed part is large cannot cause condensing on every single step.)
+        if not _scripted_demo_enabled() and _estimate_history_tokens(CONVERSATION_HISTORY) > max(
+            CONTEXT_SOFT_LIMIT_TOKENS, condense_floor + 5000
+        ):
             condense_report = await _condense_context(user_prompt, f"step {step_idx} soft limit")
             if condense_report["summarised"]:
                 history_len_before_reply = -1
                 condensed_this_turn = True
+                condense_floor = condense_report["after"]
 
         messages_for_estimate = list(CONVERSATION_HISTORY)
         if step_idx == 1 and simulate_context_tokens and simulate_context_tokens > 26000:
@@ -2498,5 +2549,23 @@ def _free_port_if_in_use(port: int = 8000) -> None:
 if __name__ == "__main__":
     import uvicorn
 
+    # Keep a log on disk so a server that exits or crashes leaves a record of why
+    import atexit
+    import faulthandler
+
+    _log_dir = BASE_DIR / "cache" / "logs"
+    _log_dir.mkdir(parents=True, exist_ok=True)
+    (_log_dir / "harness_server.log").write_text("", encoding="utf-8")  # start fresh each launch
+    _file_handler = logging.FileHandler(_log_dir / "harness_server.log", mode="a", encoding="utf-8")
+    _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logging.getLogger().addHandler(_file_handler)
+    _crash_file = open(_log_dir / "harness_crash.log", "w", encoding="utf-8")
+    faulthandler.enable(file=_crash_file, all_threads=True)  # native crashes (access violation, abort)
+    atexit.register(lambda: logger.info("Harness server process is exiting."))
+
     _free_port_if_in_use(8000)
-    uvicorn.run(app, host="127.0.0.1", port=8000, reload=False)
+    try:
+        uvicorn.run(app, host="127.0.0.1", port=8000, reload=False)
+    except BaseException as exc:
+        logger.exception(f"Harness server stopped with {type(exc).__name__}: {exc}")
+        raise

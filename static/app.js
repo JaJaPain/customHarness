@@ -1161,6 +1161,8 @@ function describeToolAction(toolName, args = {}, targetHint = "") {
     read_file: "Read file",
     list_dir: "List workspace directory",
     recall_memory: "Recall project memory (0-VRAM RAG)",
+    godot_docs: "Look up Godot reference",
+    update_task_list: `Update task list (${(args.tasks || []).filter((t) => t && t.done).length}/${(args.tasks || []).length} done)`,
     run_command: "Run validation / command",
   };
   return {
@@ -1170,43 +1172,132 @@ function describeToolAction(toolName, args = {}, targetHint = "") {
 }
 
 // Live token stream from the model (answer text, reasoning, and tool-call writing progress)
-function handleLiveLlmDelta(data) {
-  if (!data) return;
-  const card = document.getElementById("active-progress-card");
-  if (!card) return;
-  const textEl = document.getElementById("live-stream-text");
-  const thinkEl = document.getElementById("live-stream-thinking");
-  const statusHeader = document.getElementById("active-progress-header");
+// ---------- Live transcript ----------
+// The working card is one running log, newest at the bottom: each step's thinking, its note,
+// the tool call as it is being written, then the tool row - in the order they happen.
+const live = { step: null, thinkEl: null, thinkBody: null, noteEl: null, writeEl: null };
 
-  if (data.reasoning && thinkEl) {
-    if (thinkEl.dataset.step !== String(data.step)) {
-      thinkEl.dataset.step = String(data.step);
-      thinkEl.textContent = "";
-    }
-    thinkEl.classList.remove("hidden");
-    thinkEl.textContent += data.reasoning;
-    thinkEl.scrollTop = thinkEl.scrollHeight;
-    if (statusHeader) statusHeader.textContent = `Step ${data.step}: thinking...`;
-  }
-  if (data.content && textEl) {
-    if (textEl.dataset.step && textEl.dataset.step !== String(data.step) && textEl.textContent) {
-      textEl.textContent += "\n\n";
-    }
-    textEl.dataset.step = String(data.step);
-    textEl.classList.remove("hidden");
-    textEl.textContent += data.content;
-    if (thinkEl) thinkEl.classList.add("hidden");
-    if (statusHeader) statusHeader.textContent = `Step ${data.step}: writing reply...`;
-  }
-  if (data.tool_progress && statusHeader) {
-    const tp = data.tool_progress;
-    statusHeader.textContent = `Step ${data.step}: preparing ${tp.name || "tool call"} (${tp.chars.toLocaleString()} chars)...`;
-  }
+function liveTranscript() {
+  return document.getElementById("live-transcript");
+}
+
+function resetLiveTranscript() {
+  live.step = null;
+  live.thinkEl = live.thinkBody = live.noteEl = live.writeEl = null;
+}
+
+function followLiveStream() {
   // Follow the stream only if the user is already near the bottom
   const stream = document.getElementById("chat-stream");
-  if (stream && stream.scrollHeight - stream.scrollTop - stream.clientHeight < 160) {
+  if (stream && stream.scrollHeight - stream.scrollTop - stream.clientHeight < 200) {
     stream.scrollTop = stream.scrollHeight;
   }
+}
+
+function closeLiveThinking() {
+  if (live.thinkEl) {
+    live.thinkEl.open = false;
+    const n = live.thinkBody ? live.thinkBody.textContent.length : 0;
+    const label = live.thinkEl.querySelector(".live-think-label");
+    if (label) label.textContent = `Thinking · step ${live.thinkEl.dataset.step} · ${n.toLocaleString()} chars`;
+  }
+  live.thinkEl = live.thinkBody = null;
+}
+
+function closeLiveNote() {
+  if (live.noteEl) live.noteEl.classList.remove("streaming");
+  live.noteEl = null;
+}
+
+function removeLiveWriting() {
+  if (live.writeEl) live.writeEl.remove();
+  live.writeEl = null;
+}
+
+function beginLiveStep(step) {
+  if (live.step === step) return;
+  closeLiveThinking();
+  closeLiveNote();
+  removeLiveWriting();
+  live.step = step;
+}
+
+// Turn the tail of a half-written JSON arguments string into readable text
+function readableArgsTail(tail) {
+  return String(tail || "")
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "  ")
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, "\\");
+}
+
+function handleLiveLlmDelta(data) {
+  if (!data) return;
+  const log = liveTranscript();
+  if (!log) return;
+  const statusHeader = document.getElementById("active-progress-header");
+  beginLiveStep(data.step);
+
+  if (data.reasoning) {
+    if (!live.thinkEl) {
+      const d = document.createElement("details");
+      d.className = "live-think";
+      d.open = true;
+      d.dataset.step = String(data.step);
+      d.innerHTML = `<summary><span class="live-think-label">Thinking · step ${data.step}</span></summary><div class="live-think-body"></div>`;
+      log.appendChild(d);
+      live.thinkEl = d;
+      live.thinkBody = d.querySelector(".live-think-body");
+    }
+    live.thinkBody.textContent += data.reasoning;
+    live.thinkBody.scrollTop = live.thinkBody.scrollHeight;
+    if (statusHeader) statusHeader.textContent = `Step ${data.step}: thinking...`;
+  }
+  if (data.content) {
+    closeLiveThinking();
+    if (!live.noteEl) {
+      const n = document.createElement("div");
+      n.className = "msg-body live-note streaming";
+      log.appendChild(n);
+      live.noteEl = n;
+    }
+    live.noteEl.textContent += data.content;
+    if (statusHeader) statusHeader.textContent = `Step ${data.step}: writing reply...`;
+  }
+  if (data.tool_progress) {
+    const tp = data.tool_progress;
+    closeLiveThinking();
+    closeLiveNote();
+    if (!live.writeEl) {
+      const w = document.createElement("div");
+      w.className = "live-writing";
+      w.innerHTML = `<div class="live-writing-head"></div><pre class="live-writing-body"></pre>`;
+      log.appendChild(w);
+      live.writeEl = w;
+    }
+    live.writeEl.querySelector(".live-writing-head").textContent =
+      `Writing ${tp.name || "tool call"} · ${(tp.chars || 0).toLocaleString()} chars`;
+    const body = live.writeEl.querySelector(".live-writing-body");
+    body.textContent = readableArgsTail(tp.tail);
+    body.scrollTop = body.scrollHeight;
+    if (statusHeader) {
+      statusHeader.textContent = `Step ${data.step}: preparing ${tp.name || "tool call"} (${(tp.chars || 0).toLocaleString()} chars)...`;
+    }
+  }
+  followLiveStream();
+}
+
+// Pinned checklist from the model's update_task_list tool
+function renderLiveTaskList(tasks) {
+  const box = document.getElementById("live-task-list");
+  if (!box || !Array.isArray(tasks) || !tasks.length) return;
+  const done = tasks.filter((t) => t.done).length;
+  const next = tasks.find((t) => !t.done);
+  box.classList.remove("hidden");
+  box.innerHTML = `
+    <summary><span class="live-task-count">☑ ${done}/${tasks.length}</span>
+      <span class="live-task-next">${next ? "Next: " + escapeHtml(next.text) : "All steps done"}</span></summary>
+    <ul>${tasks.map((t) => `<li class="${t.done ? "done" : ""}">${t.done ? "✓" : "○"} ${escapeHtml(t.text)}</li>`).join("")}</ul>`;
 }
 
 function handleLiveStepStart(data) {
@@ -1219,7 +1310,10 @@ function handleLiveStepStart(data) {
 
 function handleLiveToolStart(data) {
   if (!data) return;
-  const listEl = document.getElementById("active-progress-list");
+  closeLiveThinking();
+  closeLiveNote();
+  removeLiveWriting();
+  const listEl = liveTranscript();
   const statusHeader = document.getElementById("active-progress-header");
   const sendBtn = document.getElementById("btn-send");
   const desc = describeToolAction(data.name, data.arguments || {}, data.target_hint || "");
@@ -1246,8 +1340,7 @@ function handleLiveToolStart(data) {
       <div class="process-details" id="live-details-${data.id}">Tool: ${escapeHtml(data.name)}\nArguments: ${escapeHtml(JSON.stringify(data.arguments || {}, null, 2))}</div>
     `;
     listEl.appendChild(details);
-    const stream = document.getElementById("chat-stream");
-    if (stream) stream.scrollTop = stream.scrollHeight;
+    followLiveStream();
   }
 }
 
@@ -1264,6 +1357,7 @@ function handleLiveToolComplete(data) {
   if (metaEl) {
     metaEl.textContent = data.elapsed_sec != null ? `${data.elapsed_sec}s` : "Done";
   }
+  if (data.name === "update_task_list" && data.result?.tasks) renderLiveTaskList(data.result.tasks);
   if (detailsEl && data.result) {
     const previewHtml = buildToolPreviewHtml(data.name, data.result);
     if (previewHtml) {
@@ -1310,14 +1404,16 @@ async function sendChatPrompt(promptText, simulateContextTokens = null) {
   progressCard.id = "active-progress-card";
   progressCard.className = "msg msg-assistant";
   progressCard.innerHTML = `
-    <div id="live-stream-text" class="msg-body live-stream-text hidden"></div>
-    <div id="active-progress-list" class="process-list"></div>
-    <div id="live-stream-thinking" class="live-stream-thinking hidden"></div>
-    <div class="msg-header live-status-row">
-      <span class="msg-role" style="color:#60a5fa;">● WORKING</span>
-      <span class="msg-meta" id="active-progress-header">Initializing step 1...</span>
+    <div id="live-transcript" class="live-transcript process-list"></div>
+    <div class="live-status-row">
+      <details id="live-task-list" class="live-task-list hidden"></details>
+      <div class="msg-header">
+        <span class="msg-role" style="color:#60a5fa;">● WORKING</span>
+        <span class="msg-meta" id="active-progress-header">Initializing step 1...</span>
+      </div>
     </div>
   `;
+  resetLiveTranscript();
   stream.appendChild(progressCard);
   progressCard.scrollIntoView({ behavior: "smooth", block: "end" });
 
@@ -1457,7 +1553,13 @@ async function finishMicRecording() {
       showMicHint("No speech was heard in that recording.", true);
     }
   } catch (err) {
-    showMicHint(`Speech-to-text failed: ${err.message || err}`, true);
+    const unreachable = err instanceof TypeError; // fetch could not reach the server at all
+    showMicHint(
+      unreachable
+        ? "Can't reach the harness server - it is not running. Start start_harness.bat, then reload this page."
+        : `Speech-to-text failed: ${err.message || err}`,
+      true
+    );
   } finally {
     mic.busy = false;
     setMicButton("idle", "🎤 Speak");
