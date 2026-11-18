@@ -446,6 +446,17 @@ class VRAMOrchestrator:
         self.extra_models_dirs: List[Path] = [
             Path(d.strip()) for d in os.environ.get("HARNESS_FAST_MODELS_DIR", "").split(";") if d.strip()
         ]
+        # The "Swap Models" app (model_swap.py) moves the big models between models/ and an SSD folder
+        # and records that folder in cache/models_location.json. It is always searched first: a file
+        # that is not there is found in models/, so either location works without any other setting.
+        ssd_dir = Path(r"C:\HarnessModels")
+        try:
+            loc = json.loads((self.base_dir / "cache" / "models_location.json").read_text(encoding="utf-8"))
+            ssd_dir = Path(loc.get("ssd_dir") or ssd_dir)
+        except Exception:
+            pass
+        if ssd_dir not in self.extra_models_dirs:
+            self.extra_models_dirs.append(ssd_dir)
         self.cache_dir = self.base_dir / "cache"
         self.slots_dir = self.cache_dir / "slots"
         self.kv_disk_dir = self.cache_dir / "kv_disk"
